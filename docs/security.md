@@ -17,11 +17,13 @@ require flags that allow automatic edits or skip normal confirmation prompts.
 For this reason, agent execution requires explicit opt-in:
 
 ```bash
-export WAVEFORWARD_ALLOW_UNSAFE_AGENT_EXECUTION=1
+waveforward daemon-start --allow-agent-execution ...
 ```
 
-Use a dedicated workspace and review the connected service before enabling this
-setting.
+The app-generated setup command includes this flag for the selected workspace.
+For manual foreground daemon runs, set `WAVEFORWARD_ALLOW_UNSAFE_AGENT_EXECUTION=1`
+or pass `waveforward daemon --allow-agent-execution ...`. Use a dedicated
+workspace and review the connected service before enabling this setting.
 
 ## Tokens
 

@@ -24,7 +24,13 @@ from waveforward.core import (
     run_doctor,
     verify_snapshot,
 )
-from waveforward.daemon import DaemonConfig, daemon_status, run_daemon
+from waveforward.daemon import (
+    UNSAFE_AGENT_EXECUTION_ENV,
+    DaemonConfig,
+    daemon_status,
+    run_daemon,
+    start_daemon_process,
+)
 from waveforward.update import check_for_update, download_update_wheel
 
 
@@ -159,7 +165,34 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Register, poll once, then exit. Mostly useful for tests.",
     )
+    daemon_parser.add_argument(
+        "--allow-agent-execution",
+        action="store_true",
+        help="Allow WaveForward to run local coding agents in this workspace.",
+    )
     daemon_parser.set_defaults(func=_cmd_daemon)
+
+    daemon_start_parser = subcommands.add_parser(
+        "daemon-start",
+        help="Start the WaveForward daemon in the background.",
+    )
+    daemon_start_parser.add_argument("--server", help="WaveForward service URL.")
+    daemon_start_parser.add_argument("--auth-user", help="Basic Auth username.")
+    daemon_start_parser.add_argument("--auth-password", help="Basic Auth password.")
+    daemon_start_parser.add_argument("--auth-token", help="Bearer token.")
+    daemon_start_parser.add_argument("--machine", help="Human-readable machine name.")
+    daemon_start_parser.add_argument(
+        "--poll-interval",
+        default=2.0,
+        type=float,
+        help="Seconds between daemon polls.",
+    )
+    daemon_start_parser.add_argument(
+        "--allow-agent-execution",
+        action="store_true",
+        help="Allow WaveForward to run local coding agents in this workspace.",
+    )
+    daemon_start_parser.set_defaults(func=_cmd_daemon_start)
 
     daemon_status_parser = subcommands.add_parser(
         "daemon-status",
@@ -356,8 +389,8 @@ def _cmd_doctor(_args: argparse.Namespace) -> int:
     return 1 if any(check.status == "error" for check in checks) else 0
 
 
-def _cmd_daemon(args: argparse.Namespace) -> None:
-    config = DaemonConfig(
+def _daemon_config_from_args(args: argparse.Namespace) -> DaemonConfig:
+    return DaemonConfig(
         server=args.server or os.getenv("WAVEFORWARD_DAEMON_SERVER", ""),
         auth_user=args.auth_user or os.getenv("WAVEFORWARD_DAEMON_USER"),
         auth_password=args.auth_password or os.getenv("WAVEFORWARD_DAEMON_PASSWORD"),
@@ -365,8 +398,14 @@ def _cmd_daemon(args: argparse.Namespace) -> None:
         machine_name=args.machine or os.getenv("WAVEFORWARD_DAEMON_MACHINE"),
         poll_interval=args.poll_interval,
     )
+
+
+def _cmd_daemon(args: argparse.Namespace) -> None:
+    config = _daemon_config_from_args(args)
     if not config.server:
         raise AgentSyncError("Missing --server or WAVEFORWARD_DAEMON_SERVER.")
+    if args.allow_agent_execution:
+        os.environ[UNSAFE_AGENT_EXECUTION_ENV] = "1"
     print(f"Connecting WaveForward daemon to {config.server}")
     try:
         run_daemon(Path.cwd(), config=config, once=args.once)
@@ -374,11 +413,31 @@ def _cmd_daemon(args: argparse.Namespace) -> None:
         print("\nStopping WaveForward daemon.")
 
 
+def _cmd_daemon_start(args: argparse.Namespace) -> None:
+    config = _daemon_config_from_args(args)
+    if not config.server:
+        raise AgentSyncError("Missing --server or WAVEFORWARD_DAEMON_SERVER.")
+    result = start_daemon_process(
+        Path.cwd(),
+        config=config,
+        allow_agent_execution=args.allow_agent_execution,
+    )
+    if result["started"]:
+        print("Started WaveForward daemon in the background.")
+    else:
+        print("WaveForward daemon is already running.")
+    print(f"PID: {result['pid']}")
+    print(f"Log: {result['log_path']}")
+
+
 def _cmd_daemon_status(_args: argparse.Namespace) -> None:
     status = daemon_status(Path.cwd())
     print(f"Configured: {'yes' if status['configured'] else 'no'}")
     print(f"Machine id: {status['machine_id'] or '-'}")
     print(f"Machine token: {'present' if status['has_machine_token'] else 'missing'}")
+    print(f"Daemon running: {'yes' if status['running'] else 'no'}")
+    print(f"PID: {status['pid'] or '-'}")
+    print(f"Log path: {status['log_path']}")
     print(f"State path: {status['state_path']}")
 
 

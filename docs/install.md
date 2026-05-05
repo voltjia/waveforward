@@ -60,17 +60,21 @@ scripts/install.sh --repo https://github.com/voltjia/waveforward.git --ref main
 ## Connect A Daemon
 
 After installing the command, generate a setup token from a WaveForward service
-and run the daemon command inside the workspace that should execute agent turns:
+and run the generated daemon command inside the workspace that should execute
+agent turns:
 
 ```bash
-waveforward daemon \
+waveforward daemon-start \
   --server https://app.waveforward.tech \
   --auth-token '<setup-token>' \
-  --machine 'Laptop'
+  --machine 'Laptop' \
+  --allow-agent-execution
 ```
 
 After first registration, the daemon stores its machine token under
-`.waveforward/daemon.json`. Keep that file private.
+`.waveforward/daemon.json` and writes background process state under
+`.waveforward/daemon.pid` and `.waveforward/daemon.log`. Keep these files
+private.
 
 ## Install A Persistent Linux Daemon
 
