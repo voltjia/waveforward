@@ -41,6 +41,12 @@ waveforward --version
 wf --version
 ```
 
+After the PyPI project is configured, Python users can also install with:
+
+```bash
+python -m pip install waveforward
+```
+
 ## Local Development
 
 Run tests:
