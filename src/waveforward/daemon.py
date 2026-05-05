@@ -324,7 +324,8 @@ def _process_job(
             on_output=post_output,
         )
     except Exception as error:
-        client.post(
+        _post_job_completion(
+            client,
             f"/api/daemon/jobs/{job_id}/complete",
             {
                 "machine_id": machine["id"],
@@ -333,7 +334,8 @@ def _process_job(
         )
         return
 
-    client.post(
+    _post_job_completion(
+        client,
         f"/api/daemon/jobs/{job_id}/complete",
         {
             "machine_id": machine["id"],
@@ -341,6 +343,27 @@ def _process_job(
             "agent_run": _agent_run_payload(turn.agent_run),
         },
     )
+
+
+def _post_job_completion(
+    client: CloudClient,
+    path: str,
+    payload: dict[str, Any],
+    *,
+    attempts: int = 12,
+) -> None:
+    last_error: AgentSyncError | None = None
+    for attempt in range(max(attempts, 1)):
+        try:
+            client.post(path, payload)
+            return
+        except AgentSyncError as error:
+            last_error = error
+            if attempt >= attempts - 1:
+                break
+            time.sleep(min(1.5 * (attempt + 1), 10.0))
+    if last_error is not None:
+        raise last_error
 
 
 def _agent_run_payload(item: AgentRunResult | None) -> dict[str, Any] | None:

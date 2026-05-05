@@ -170,8 +170,25 @@ class AgentSyncCoreTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             checks = run_doctor(Path(directory))
 
-            self.assertEqual(checks[0].status, "error")
+            self.assertEqual(checks[0].status, "warn")
             self.assertEqual(checks[0].name, "git repository")
+            self.assertIn(
+                "Snapshot and migration features disabled.",
+                {check.detail for check in checks},
+            )
+
+    def test_initialize_workspace_allows_non_git_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+
+            config = initialize_workspace(root, machine_name="scratch")
+            snapshots = list_snapshots(root)
+
+            self.assertEqual(config, root / ".waveforward" / "config.toml")
+            self.assertTrue(config.is_file())
+            self.assertEqual(snapshots, [])
+            with self.assertRaisesRegex(AgentSyncError, "not managed by Git"):
+                create_snapshot(root)
 
 
 class git_repo:

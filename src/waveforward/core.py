@@ -25,6 +25,11 @@ DEFAULT_MAX_FILE_BYTES = 256 * 1024
 BUNDLE_VERSION = 1
 SNAPSHOT_VERSION = 1
 SYNC_DIR_NAME = ".waveforward"
+NON_GIT_WORKSPACE_MESSAGE = (
+    "This workspace is not managed by Git. Basic conversations still work, "
+    "but snapshots, packages, and machine migration require Git. Run `git init` "
+    "to enable those features."
+)
 
 
 class AgentSyncError(RuntimeError):
@@ -94,8 +99,29 @@ class DoctorCheck:
 def repo_root(start: Path | str = ".") -> Path:
     """Return the containing Git repository root."""
 
-    result = _run(["git", "rev-parse", "--show-toplevel"], Path(start))
+    result = _run(["git", "rev-parse", "--show-toplevel"], Path(start), check=False)
+    if result.returncode != 0:
+        raise AgentSyncError(NON_GIT_WORKSPACE_MESSAGE)
     return Path(result.stdout.strip()).resolve()
+
+
+def workspace_root(start: Path | str = ".") -> Path:
+    """Return a Git root when available, otherwise the given directory."""
+
+    try:
+        return repo_root(start)
+    except AgentSyncError:
+        return Path(start).resolve()
+
+
+def is_git_workspace(start: Path | str = ".") -> bool:
+    """Return whether the path is inside a Git worktree."""
+
+    try:
+        repo_root(start)
+    except AgentSyncError:
+        return False
+    return True
 
 
 def sync_dir(root: Path) -> Path:
@@ -112,7 +138,7 @@ def initialize_workspace(
 ) -> Path:
     """Create the local WaveForward metadata directory."""
 
-    root = repo_root(start)
+    root = workspace_root(start)
     base = sync_dir(root)
     config_path = base / "config.toml"
 
@@ -150,7 +176,7 @@ def update_machine_name(start: Path | str = ".", machine_name: str = "") -> Path
     if not name:
         raise AgentSyncError("Machine name is required.")
 
-    root = repo_root(start)
+    root = workspace_root(start)
     config_path = initialize_workspace(root)
     try:
         config = tomllib.loads(config_path.read_text(encoding="utf-8"))
@@ -261,7 +287,7 @@ def create_snapshot(
 def list_snapshots(start: Path | str = ".") -> list[dict[str, Any]]:
     """Return known snapshots, newest first."""
 
-    root = repo_root(start)
+    root = workspace_root(start)
     sessions = sync_dir(root) / "sessions"
     if not sessions.exists():
         return []
@@ -272,7 +298,7 @@ def list_snapshots(start: Path | str = ".") -> list[dict[str, Any]]:
             snapshots.append(_read_json(metadata_path))
         except (OSError, json.JSONDecodeError):
             continue
-    return sorted(snapshots, key=lambda item: item.get("id", ""), reverse=True)
+    return sorted(snapshots, key=lambda item: item.get("created_at", ""), reverse=True)
 
 
 def generate_handoff(
@@ -283,7 +309,7 @@ def generate_handoff(
 ) -> Path:
     """Create a Markdown handoff document for another agent."""
 
-    root = repo_root(start)
+    root = workspace_root(start)
     snapshot_path = resolve_snapshot_path(root, snapshot_ref)
     metadata = _read_json(snapshot_path / "metadata.json")
     manifest = _read_json(snapshot_path / "untracked_manifest.json")
@@ -307,7 +333,7 @@ def verify_snapshot(
 ) -> SnapshotVerification:
     """Verify that a local snapshot has all required artifacts intact."""
 
-    root = repo_root(start)
+    root = workspace_root(start)
     snapshot_path = resolve_snapshot_path(root, snapshot_ref)
     metadata = _validate_snapshot_directory(snapshot_path)
     capture = metadata.get("capture", {})
@@ -411,12 +437,15 @@ def run_doctor(start: Path | str = ".") -> list[DoctorCheck]:
     """Inspect local prerequisites and workspace health."""
 
     checks: list[DoctorCheck] = []
+    git_available = True
     try:
         root = repo_root(start)
     except AgentSyncError as error:
-        return [DoctorCheck("git repository", "error", str(error))]
-
-    checks.append(DoctorCheck("git repository", "ok", str(root)))
+        root = workspace_root(start)
+        git_available = False
+        checks.append(DoctorCheck("git repository", "warn", str(error)))
+    else:
+        checks.append(DoctorCheck("git repository", "ok", str(root)))
 
     python_detail = (
         f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
@@ -438,25 +467,32 @@ def run_doctor(start: Path | str = ".") -> list[DoctorCheck]:
     else:
         checks.append(DoctorCheck("metadata directory", "warn", f"{base} is missing."))
 
-    ignored = _git(
-        root, "check-ignore", "-q", f"{SYNC_DIR_NAME}/config.toml", check=False
-    )
-    if ignored.returncode == 0:
-        checks.append(DoctorCheck("metadata ignore", "ok", f"{SYNC_DIR_NAME} ignored."))
+    if git_available:
+        ignored = _git(
+            root, "check-ignore", "-q", f"{SYNC_DIR_NAME}/config.toml", check=False
+        )
+        if ignored.returncode == 0:
+            checks.append(
+                DoctorCheck("metadata ignore", "ok", f"{SYNC_DIR_NAME} ignored.")
+            )
+        else:
+            checks.append(
+                DoctorCheck(
+                    "metadata ignore",
+                    "warn",
+                    f"Add `{SYNC_DIR_NAME}/` to `.gitignore`.",
+                )
+            )
+
+        dirty = _git(root, "status", "--porcelain=v1").stdout.strip()
+        if dirty:
+            checks.append(DoctorCheck("worktree", "warn", "Uncommitted changes exist."))
+        else:
+            checks.append(DoctorCheck("worktree", "ok", "Clean."))
     else:
         checks.append(
-            DoctorCheck(
-                "metadata ignore",
-                "warn",
-                f"Add `{SYNC_DIR_NAME}/` to `.gitignore`.",
-            )
+            DoctorCheck("worktree", "warn", "Snapshot and migration features disabled.")
         )
-
-    dirty = _git(root, "status", "--porcelain=v1").stdout.strip()
-    if dirty:
-        checks.append(DoctorCheck("worktree", "warn", "Uncommitted changes exist."))
-    else:
-        checks.append(DoctorCheck("worktree", "ok", "Clean."))
 
     snapshots = list_snapshots(root)
     checks.append(DoctorCheck("snapshots", "ok", f"{len(snapshots)} available."))
