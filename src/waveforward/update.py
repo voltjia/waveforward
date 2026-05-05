@@ -1,4 +1,4 @@
-"""Alpha release manifest parsing and update checks."""
+"""Release manifest parsing and update checks."""
 
 from __future__ import annotations
 
@@ -14,14 +14,15 @@ from typing import Any
 from waveforward import __version__
 from waveforward.core import AgentSyncError
 
-MANIFEST_FORMAT = "waveforward.alpha_manifest"
+MANIFEST_FORMAT = "waveforward.release_manifest"
+LEGACY_MANIFEST_FORMAT = "waveforward.alpha_manifest"
 MANIFEST_FORMAT_VERSION = 1
 DEFAULT_TIMEOUT_SECONDS = 20
 
 
 @dataclass(frozen=True)
 class ReleaseWheel:
-    """Wheel asset advertised by an alpha release manifest."""
+    """Wheel asset advertised by a release manifest."""
 
     url: str
     sha256: str
@@ -29,7 +30,7 @@ class ReleaseWheel:
 
 @dataclass(frozen=True)
 class UpdateManifest:
-    """Validated alpha release manifest."""
+    """Validated release manifest."""
 
     version: str
     commit: str
@@ -38,7 +39,7 @@ class UpdateManifest:
 
 @dataclass(frozen=True)
 class UpdateCheckResult:
-    """Result of comparing an alpha manifest to the local installation."""
+    """Result of comparing a release manifest to the local installation."""
 
     current_version: str
     current_commit: str
@@ -106,7 +107,7 @@ def load_update_manifest(
     *,
     headers: dict[str, str] | None = None,
 ) -> UpdateManifest:
-    """Load and validate an alpha release manifest from a path or URL."""
+    """Load and validate a release manifest from a path or URL."""
 
     try:
         raw = _read_location_bytes(str(location), headers=headers)
@@ -183,7 +184,7 @@ def download_update_wheel(
 def _validate_manifest(data: Any) -> UpdateManifest:
     if not isinstance(data, dict):
         raise AgentSyncError("Update manifest must be a JSON object.")
-    if data.get("format") != MANIFEST_FORMAT:
+    if data.get("format") not in {MANIFEST_FORMAT, LEGACY_MANIFEST_FORMAT}:
         raise AgentSyncError("Update manifest format is not supported.")
     if data.get("format_version") != MANIFEST_FORMAT_VERSION:
         raise AgentSyncError("Update manifest format version is not supported.")

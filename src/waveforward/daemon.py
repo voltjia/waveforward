@@ -1,4 +1,4 @@
-"""Outbound daemon for connecting local machines to a WaveForward cloud service."""
+"""Outbound daemon for connecting local machines to a WaveForward service."""
 
 from __future__ import annotations
 
@@ -67,7 +67,7 @@ class DaemonConfig:
 
 
 class CloudClient:
-    """Small JSON client for the WaveForward cloud daemon API."""
+    """Small JSON client for the WaveForward daemon API."""
 
     def __init__(self, config: DaemonConfig) -> None:
         self.server = config.server.rstrip("/") + "/"
@@ -374,7 +374,7 @@ def _daemon_update_manifest_url(client: CloudClient, config: DaemonConfig) -> st
     configured = (config.update_manifest_url or "").strip()
     if configured:
         return configured
-    return urljoin(client.server, "api/releases/alpha/waveforward-alpha-manifest.json")
+    return urljoin(client.server, "api/releases/waveforward-release-manifest.json")
 
 
 def _load_or_create_daemon_state(root: Path) -> dict[str, Any]:

@@ -272,7 +272,7 @@ def list_snapshots(start: Path | str = ".") -> list[dict[str, Any]]:
             snapshots.append(_read_json(metadata_path))
         except (OSError, json.JSONDecodeError):
             continue
-    return sorted(snapshots, key=lambda item: item.get("created_at", ""), reverse=True)
+    return sorted(snapshots, key=lambda item: item.get("id", ""), reverse=True)
 
 
 def generate_handoff(

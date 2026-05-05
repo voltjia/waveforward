@@ -21,17 +21,17 @@ Options:
   --python COMMAND   Python command. Defaults to python3.
   --source DIR       Install from a local checkout.
   --archive PATH     Install from a local source archive or package URL.
-  --manifest PATH    Install from an alpha release manifest path or URL.
+  --manifest PATH    Install from a release manifest path or URL.
   --repo URL         Install from a Git repository URL.
   --ref REF          Git ref for --repo installs.
   -h, --help         Show this help.
 
 Examples:
   scripts/install.sh --source .
-  scripts/install.sh --archive waveforward-0.1.0-alpha.tar.gz
-  scripts/install.sh --archive https://example.com/waveforward-0.1.0-alpha.tar.gz
-  scripts/install.sh --manifest waveforward-alpha-manifest.json
-  scripts/install.sh --manifest https://example.com/waveforward-alpha-manifest.json
+  scripts/install.sh --archive waveforward-0.1.0.tar.gz
+  scripts/install.sh --archive https://example.com/waveforward-0.1.0.tar.gz
+  scripts/install.sh --manifest waveforward-release-manifest.json
+  scripts/install.sh --manifest https://example.com/waveforward-release-manifest.json
   scripts/install.sh --repo https://github.com/voltjia/waveforward.git --ref main
 
 Environment:
@@ -226,7 +226,10 @@ try:
 except json.JSONDecodeError as error:
     raise SystemExit(f"error: invalid release manifest JSON: {error.msg}") from error
 
-if manifest.get("format") != "waveforward.alpha_manifest":
+if manifest.get("format") not in {
+    "waveforward.release_manifest",
+    "waveforward.alpha_manifest",
+}:
     raise SystemExit("error: release manifest format is not supported")
 if manifest.get("format_version") != 1:
     raise SystemExit("error: release manifest version is not supported")

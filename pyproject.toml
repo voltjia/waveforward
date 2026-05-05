@@ -13,6 +13,21 @@ authors = [
   { name = "WaveForward" },
 ]
 dependencies = []
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: Apache Software License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Software Development",
+]
+
+[project.urls]
+Homepage = "https://waveforward.tech"
+Repository = "https://github.com/voltjia/waveforward"
+Issues = "https://github.com/voltjia/waveforward/issues"
 
 [project.scripts]
 waveforward = "waveforward.cli:main"
@@ -20,6 +35,7 @@ wf = "waveforward.cli:main"
 
 [project.optional-dependencies]
 dev = [
+  "build>=1.3.0",
   "ruff>=0.15.0",
 ]
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import tempfile
@@ -12,6 +13,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from waveforward.core import AgentSyncError  # noqa: E402
 from waveforward.runner import (  # noqa: E402
+    UNSAFE_AGENT_EXECUTION_ENV,
     agent_capabilities,
     run_claude_code,
     run_codex,
@@ -24,6 +26,7 @@ class RunnerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             with (
+                patch.dict(os.environ, {UNSAFE_AGENT_EXECUTION_ENV: "1"}),
                 patch(
                     "waveforward.runner.shutil.which",
                     return_value="/usr/bin/claude",
@@ -53,6 +56,7 @@ class RunnerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             with (
+                patch.dict(os.environ, {UNSAFE_AGENT_EXECUTION_ENV: "1"}),
                 patch("waveforward.runner.shutil.which", return_value="/usr/bin/codex"),
                 patch("waveforward.runner.subprocess.run") as run,
             ):
@@ -78,6 +82,7 @@ class RunnerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             with (
+                patch.dict(os.environ, {UNSAFE_AGENT_EXECUTION_ENV: "1"}),
                 patch(
                     "waveforward.runner.shutil.which",
                     return_value="/usr/bin/opencode",
@@ -114,8 +119,18 @@ class RunnerTests(unittest.TestCase):
     def test_missing_agent_command_returns_clear_error(self) -> None:
         with (
             tempfile.TemporaryDirectory() as directory,
+            patch.dict(os.environ, {UNSAFE_AGENT_EXECUTION_ENV: "1"}),
             patch("waveforward.runner.shutil.which", return_value=None),
             self.assertRaisesRegex(AgentSyncError, "Codex is not installed"),
+        ):
+            run_codex(Path(directory), prompt="continue this")
+
+    def test_agent_execution_requires_explicit_opt_in(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch.dict(os.environ, {}, clear=True),
+            patch("waveforward.runner.shutil.which", return_value="/usr/bin/codex"),
+            self.assertRaisesRegex(AgentSyncError, "opt in"),
         ):
             run_codex(Path(directory), prompt="continue this")
 

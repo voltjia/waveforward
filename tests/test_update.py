@@ -107,6 +107,25 @@ class WaveForwardUpdateTests(unittest.TestCase):
             with self.assertRaisesRegex(AgentSyncError, "format"):
                 load_update_manifest(path)
 
+    def test_update_manifest_accepts_public_release_format(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "manifest.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "format": "waveforward.release_manifest",
+                        "format_version": 1,
+                        "version": "0.2.0",
+                        "wheel": {"url": "x.whl", "sha256": "0" * 64},
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            manifest = load_update_manifest(path)
+
+            self.assertEqual(manifest.version, "0.2.0")
+
     def test_download_update_wheel_verifies_and_copies_asset(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

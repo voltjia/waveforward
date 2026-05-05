@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import subprocess
@@ -22,6 +23,7 @@ AGENT_COMMANDS = {
     "codex": ("Codex", "codex"),
     "opencode": ("OpenCode", "opencode"),
 }
+UNSAFE_AGENT_EXECUTION_ENV = "WAVEFORWARD_ALLOW_UNSAFE_AGENT_EXECUTION"
 
 
 @dataclass(frozen=True)
@@ -76,6 +78,7 @@ def run_claude_code(
     """Run Claude Code non-interactively in a workspace."""
 
     _require_agent_command("claude-code")
+    _require_unsafe_agent_execution("Claude Code")
     command = (
         "claude",
         "--print",
@@ -107,6 +110,7 @@ def run_codex(
     """Run Codex CLI non-interactively in a workspace."""
 
     _require_agent_command("codex")
+    _require_unsafe_agent_execution("Codex")
     with tempfile.TemporaryDirectory(prefix="waveforward-codex-") as temp_dir:
         last_message_path = Path(temp_dir) / "last-message.txt"
         command = (
@@ -144,6 +148,7 @@ def run_opencode(
     """Run OpenCode non-interactively in a workspace."""
 
     _require_agent_command("opencode")
+    _require_unsafe_agent_execution("OpenCode")
     command = (
         "opencode",
         "run",
@@ -211,3 +216,12 @@ def _require_agent_command(agent: str) -> None:
         raise AgentSyncError(
             f"{label} is not installed or is not on PATH for this WaveForward service."
         )
+
+
+def _require_unsafe_agent_execution(label: str) -> None:
+    if os.getenv(UNSAFE_AGENT_EXECUTION_ENV, "").strip() == "1":
+        return
+    raise AgentSyncError(
+        f"{label} execution through WaveForward can edit files and run commands. "
+        f"Set {UNSAFE_AGENT_EXECUTION_ENV}=1 to opt in for this workspace."
+    )

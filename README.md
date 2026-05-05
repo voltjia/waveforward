@@ -21,9 +21,14 @@ release distribution, and cloud administration live outside this repository.
 - A daemon client that connects a local workspace to a WaveForward service.
 - Release manifest verification and update helpers.
 
+## Status
+
+WaveForward Core is alpha software. The public API, release format, and service
+protocol may change before a stable release.
+
 ## Install
 
-The public installer path is:
+The intended public installer path is:
 
 ```bash
 curl -fsSL https://waveforward.tech/install.sh | sh
@@ -62,7 +67,17 @@ uvx ruff check .
 WaveForward may inspect local Git working trees and execute configured agent
 commands inside user-selected workspaces. Treat daemon tokens and
 `.waveforward/daemon.json` as sensitive local credentials. Do not commit
-`.waveforward` state, API keys, agent credentials, or private release artifacts.
+`.waveforward` state, API keys, agent credentials, or release artifacts that
+should not be public.
+
+Agent execution that uses automatic edit or permission-bypass modes requires an
+explicit local opt-in:
+
+```bash
+export WAVEFORWARD_ALLOW_UNSAFE_AGENT_EXECUTION=1
+```
+
+See `docs/security.md` and `SECURITY.md`.
 
 ## License
 

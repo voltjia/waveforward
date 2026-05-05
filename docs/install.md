@@ -106,6 +106,6 @@ curl -fsSL https://waveforward.tech/install.sh | sh
 Or install from a verified release manifest:
 
 ```bash
-waveforward update-check waveforward-alpha-manifest.json --verify-asset
-waveforward update-install waveforward-alpha-manifest.json --apply
+waveforward update-check waveforward-release-manifest.json --verify-asset
+waveforward update-install waveforward-release-manifest.json --apply
 ```
