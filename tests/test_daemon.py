@@ -3,22 +3,26 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 from urllib.error import URLError
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from waveforward.daemon import (  # noqa: E402
+    UNSAFE_AGENT_EXECUTION_ENV,
     CloudClient,
     DaemonConfig,
     _daemon_update_payload,
     _load_or_create_daemon_state,
     _save_daemon_state,
     daemon_status,
+    start_daemon_process,
 )
 
 
@@ -57,6 +61,10 @@ class _ReadTimeoutOpener:
         if self.calls == 1:
             return _TimeoutResponse()
         return _FakeResponse({"ok": True, "value": 7})
+
+
+class _FakeProcess:
+    pid = 4242
 
 
 class DaemonClientTests(unittest.TestCase):
@@ -127,6 +135,64 @@ class DaemonClientTests(unittest.TestCase):
             self.assertTrue(status["has_machine_token"])
             self.assertEqual(status["machine_id"], "machine_alpha")
             self.assertNotIn("wfm_secret", str(status))
+
+    def test_start_daemon_process_detaches_and_sets_execution_opt_in(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            subprocess.run(["git", "init"], cwd=root, check=True, capture_output=True)
+            config = DaemonConfig(
+                server="https://app.example.test",
+                auth_token="setup-secret",
+                machine_name="Laptop",
+            )
+            with patch(
+                "waveforward.daemon.Popen",
+                return_value=_FakeProcess(),
+            ) as popen:
+                result = start_daemon_process(
+                    root,
+                    config=config,
+                    allow_agent_execution=True,
+                    python="/usr/bin/python3",
+                )
+
+            command = popen.call_args.args[0]
+            kwargs = popen.call_args.kwargs
+            self.assertTrue(result["started"])
+            self.assertEqual(result["pid"], 4242)
+            self.assertEqual(
+                command[:4], ["/usr/bin/python3", "-m", "waveforward.cli", "daemon"]
+            )
+            self.assertIn("--auth-token", command)
+            self.assertIn("setup-secret", command)
+            self.assertEqual(kwargs["cwd"], root.resolve())
+            self.assertEqual(kwargs["env"][UNSAFE_AGENT_EXECUTION_ENV], "1")
+            pid_path = root / ".waveforward" / "daemon.pid"
+            self.assertEqual(pid_path.read_text(encoding="utf-8"), "4242\n")
+            self.assertNotIn("setup-secret", pid_path.read_text(encoding="utf-8"))
+
+    def test_start_daemon_process_reuses_running_daemon(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            subprocess.run(["git", "init"], cwd=root, check=True, capture_output=True)
+            (root / ".waveforward").mkdir()
+            (root / ".waveforward" / "daemon.pid").write_text(
+                "4242\n",
+                encoding="utf-8",
+            )
+            with (
+                patch("waveforward.daemon._pid_running", return_value=True),
+                patch("waveforward.daemon.Popen") as popen,
+            ):
+                result = start_daemon_process(
+                    root,
+                    config=DaemonConfig(server="https://app.example.test"),
+                )
+
+            self.assertFalse(result["started"])
+            self.assertTrue(result["already_running"])
+            self.assertEqual(result["pid"], 4242)
+            popen.assert_not_called()
 
     def test_daemon_update_payload_checks_manifest_and_caches_result(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

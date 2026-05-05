@@ -12,6 +12,7 @@ import uuid
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
+from subprocess import DEVNULL, STDOUT, Popen
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin
@@ -31,6 +32,8 @@ from waveforward.service import (
     service_status,
 )
 from waveforward.update import check_for_update
+
+UNSAFE_AGENT_EXECUTION_ENV = "WAVEFORWARD_ALLOW_UNSAFE_AGENT_EXECUTION"
 
 
 @dataclass(frozen=True)
@@ -162,6 +165,7 @@ def daemon_status(start: Path | str = ".") -> dict[str, Any]:
 
     root = Path(start)
     path = _daemon_state_path(root)
+    pid_path = _daemon_pid_path(root)
     data: dict[str, Any] = {}
     if path.exists():
         try:
@@ -169,11 +173,73 @@ def daemon_status(start: Path | str = ".") -> dict[str, Any]:
         except json.JSONDecodeError:
             data = {}
     machine_id = str(data.get("machine_id") or "").strip()
+    pid = _read_daemon_pid(pid_path)
     return {
         "configured": bool(machine_id),
         "has_machine_token": bool(str(data.get("machine_token") or "").strip()),
+        "log_path": str(_daemon_log_path(root)),
         "machine_id": machine_id,
+        "pid": pid or None,
+        "pid_path": str(pid_path),
+        "running": bool(pid and _pid_running(pid)),
         "state_path": str(path),
+    }
+
+
+def start_daemon_process(
+    start: Path | str = ".",
+    *,
+    config: DaemonConfig,
+    allow_agent_execution: bool = False,
+    python: str | None = None,
+) -> dict[str, Any]:
+    """Start the outbound daemon as a detached background process."""
+
+    root = Path(start).resolve()
+    initialize_workspace(root)
+    pid_path = _daemon_pid_path(root)
+    log_path = _daemon_log_path(root)
+    existing_pid = _read_daemon_pid(pid_path)
+    if existing_pid and _pid_running(existing_pid):
+        return {
+            "already_running": True,
+            "log_path": str(log_path),
+            "pid": existing_pid,
+            "pid_path": str(pid_path),
+            "started": False,
+        }
+
+    executable = (python or sys.executable).strip()
+    if not executable:
+        raise AgentSyncError("Python executable is required to start the daemon.")
+    if not config.server:
+        raise AgentSyncError("Missing daemon server URL.")
+
+    command = _daemon_process_command(config, python=executable)
+    env = os.environ.copy()
+    if allow_agent_execution:
+        env[UNSAFE_AGENT_EXECUTION_ENV] = "1"
+    if config.update_manifest_url:
+        env["WAVEFORWARD_DAEMON_UPDATE_MANIFEST_URL"] = config.update_manifest_url
+
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("ab") as log_file:
+        process = Popen(
+            command,
+            cwd=root,
+            env=env,
+            stdin=DEVNULL,
+            stdout=log_file,
+            stderr=STDOUT,
+            start_new_session=True,
+        )
+    _write_daemon_pid(pid_path, process.pid)
+    return {
+        "already_running": False,
+        "log_path": str(log_path),
+        "pid": process.pid,
+        "pid_path": str(pid_path),
+        "started": True,
     }
 
 
@@ -413,6 +479,62 @@ def _save_daemon_state(root: Path, state: dict[str, Any]) -> None:
 
 def _daemon_state_path(root: Path) -> Path:
     return sync_dir(root) / "daemon.json"
+
+
+def _daemon_pid_path(root: Path) -> Path:
+    return sync_dir(root) / "daemon.pid"
+
+
+def _daemon_log_path(root: Path) -> Path:
+    return sync_dir(root) / "daemon.log"
+
+
+def _daemon_process_command(config: DaemonConfig, *, python: str) -> list[str]:
+    command = [
+        python,
+        "-m",
+        "waveforward.cli",
+        "daemon",
+        "--server",
+        config.server,
+    ]
+    if config.auth_user:
+        command.extend(["--auth-user", config.auth_user])
+    if config.auth_password:
+        command.extend(["--auth-password", config.auth_password])
+    if config.auth_token:
+        command.extend(["--auth-token", config.auth_token])
+    if config.machine_name:
+        command.extend(["--machine", config.machine_name])
+    command.extend(["--poll-interval", str(config.poll_interval)])
+    return command
+
+
+def _read_daemon_pid(path: Path) -> int:
+    try:
+        return int(path.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return 0
+
+
+def _write_daemon_pid(path: Path, pid: int) -> None:
+    path.write_text(f"{pid}\n", encoding="utf-8")
+    with suppress(OSError):
+        path.chmod(0o600)
+
+
+def _pid_running(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
 
 
 def _build_auth_header(config: DaemonConfig) -> str | None:

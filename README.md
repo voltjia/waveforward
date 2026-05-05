@@ -77,10 +77,11 @@ commands inside user-selected workspaces. Treat daemon tokens and
 should not be public.
 
 Agent execution that uses automatic edit or permission-bypass modes requires an
-explicit local opt-in:
+explicit local opt-in. The app-generated `waveforward daemon-start` command
+includes this opt-in for the selected workspace:
 
 ```bash
-export WAVEFORWARD_ALLOW_UNSAFE_AGENT_EXECUTION=1
+waveforward daemon-start --allow-agent-execution ...
 ```
 
 See `docs/security.md` and `SECURITY.md`.
