@@ -218,6 +218,26 @@ def archive_conversation(
     return conversation
 
 
+def rename_conversation(
+    start: Path | str,
+    conversation_id: str,
+    *,
+    title: str,
+    owner: str | None = None,
+) -> dict[str, Any]:
+    """Rename a WaveForward conversation."""
+
+    clean_title = title.strip()
+    if not clean_title:
+        raise ValueError("Session title is required.")
+    root = Path(start)
+    conversation = get_conversation(root, conversation_id, owner=owner)
+    conversation["title"] = clean_title
+    conversation["updated_at"] = utc_now()
+    _write_conversation(root, conversation)
+    return conversation
+
+
 def delete_conversation(
     start: Path | str,
     conversation_id: str,

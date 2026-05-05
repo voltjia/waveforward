@@ -20,6 +20,7 @@ from waveforward.daemon import (  # noqa: E402
     DaemonConfig,
     _daemon_update_payload,
     _load_or_create_daemon_state,
+    _post_job_completion,
     _save_daemon_state,
     daemon_status,
     start_daemon_process,
@@ -65,6 +66,20 @@ class _ReadTimeoutOpener:
 
 class _FakeProcess:
     pid = 4242
+
+
+class _CompletionClient:
+    def __init__(self, failures: int) -> None:
+        self.calls = 0
+        self.failures = failures
+
+    def post(self, _path: str, _payload: dict[str, object]) -> dict[str, object]:
+        self.calls += 1
+        if self.calls <= self.failures:
+            from waveforward.core import AgentSyncError
+
+            raise AgentSyncError("Cloud request failed: 502")
+        return {"ok": True}
 
 
 class DaemonClientTests(unittest.TestCase):
@@ -257,6 +272,19 @@ class DaemonClientTests(unittest.TestCase):
             self.assertTrue(result["configured"])
             self.assertFalse(result["verified"])
             self.assertEqual(result["reason"], "update check failed")
+
+    def test_job_completion_retries_transient_cloud_errors(self) -> None:
+        client = _CompletionClient(failures=2)
+        with patch("waveforward.daemon.time.sleep") as sleep:
+            _post_job_completion(
+                client,
+                "/api/daemon/jobs/run_alpha/complete",
+                {"machine_id": "machine_alpha"},
+                attempts=3,
+            )
+
+        self.assertEqual(client.calls, 3)
+        self.assertEqual(sleep.call_count, 2)
 
 
 if __name__ == "__main__":
