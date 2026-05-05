@@ -1,0 +1,70 @@
+# WaveForward
+
+WaveForward is the open-core local runtime for portable coding-agent session
+continuity. It captures recoverable workspace state, prepares handoff context,
+and runs the machine-side daemon that connects a workstation or server to a
+WaveForward-compatible service.
+
+This repository is intentionally limited to code that users may run on their
+own machines. Hosted app code, multi-user auth, deployment automation, private
+release distribution, and cloud administration live outside this repository.
+
+## What Is Included
+
+- Local workspace metadata initialization.
+- Git-based snapshots of status, staged diff, unstaged diff, and small
+  untracked files.
+- Portable snapshot bundles for moving work between machines.
+- Restore preview and restore application.
+- Markdown handoff generation for agent continuation.
+- Local agent command runners for Codex, Claude Code, and OpenCode.
+- A daemon client that connects a local workspace to a WaveForward service.
+- Release manifest verification and update helpers.
+
+## Install
+
+The public installer path is:
+
+```bash
+curl -fsSL https://waveforward.tech/install.sh | sh
+```
+
+After installation, both commands are available:
+
+```bash
+waveforward --version
+wf --version
+```
+
+## Local Development
+
+Run tests:
+
+```bash
+python3 -m unittest discover -s tests
+```
+
+Run the CLI from a checkout:
+
+```bash
+PYTHONPATH=src python3 -m waveforward.cli --help
+```
+
+Format and lint:
+
+```bash
+uvx ruff format .
+uvx ruff check .
+```
+
+## Security Boundary
+
+WaveForward may inspect local Git working trees and execute configured agent
+commands inside user-selected workspaces. Treat daemon tokens and
+`.waveforward/daemon.json` as sensitive local credentials. Do not commit
+`.waveforward` state, API keys, agent credentials, or private release artifacts.
+
+## License
+
+WaveForward is licensed under the Apache License, Version 2.0. See
+`LICENSE` and `NOTICE`.

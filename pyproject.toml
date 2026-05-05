@@ -1,0 +1,40 @@
+[build-system]
+requires = ["hatchling>=1.26"]
+build-backend = "hatchling.build"
+
+[project]
+name = "waveforward"
+version = "0.1.0"
+description = "Open-core local runtime for portable coding-agent session continuity."
+readme = "README.md"
+requires-python = ">=3.12"
+license = "Apache-2.0"
+authors = [
+  { name = "WaveForward" },
+]
+dependencies = []
+
+[project.scripts]
+waveforward = "waveforward.cli:main"
+wf = "waveforward.cli:main"
+
+[project.optional-dependencies]
+dev = [
+  "ruff>=0.15.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/waveforward"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["B", "E", "F", "I", "RUF", "SIM", "UP"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "auto"
