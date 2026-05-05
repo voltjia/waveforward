@@ -32,6 +32,10 @@ WaveForward Core releases are tag-based.
 The GitHub release workflow builds distributions, creates the manifest, and
 uploads release assets.
 
+## PyPI
+
+Publish to PyPI only through Trusted Publishing. See `docs/pypi.md`.
+
 ## Installer Channel
 
 The public installer at `https://waveforward.tech/install.sh` should point at
