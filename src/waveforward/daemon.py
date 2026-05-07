@@ -15,7 +15,7 @@ from pathlib import Path
 from subprocess import DEVNULL, STDOUT, Popen
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 from urllib.request import Request, build_opener
 
 from waveforward import __version__
@@ -24,6 +24,17 @@ from waveforward.core import (
     initialize_workspace,
     sync_dir,
     update_machine_name,
+)
+from waveforward.files import (
+    list_workspace_tree,
+    read_workspace_file,
+    workspace_file_diff,
+    write_workspace_file,
+)
+from waveforward.history import (
+    DEFAULT_HISTORY_LIMIT,
+    discover_agent_sessions,
+    import_agent_sessions,
 )
 from waveforward.runner import AgentRunResult, agent_capabilities
 from waveforward.service import (
@@ -34,6 +45,10 @@ from waveforward.service import (
 from waveforward.update import check_for_update
 
 UNSAFE_AGENT_EXECUTION_ENV = "WAVEFORWARD_ALLOW_UNSAFE_AGENT_EXECUTION"
+PUBLIC_RELEASE_MANIFEST_URL = (
+    "https://github.com/voltjia/waveforward/releases/latest/download/"
+    "waveforward-release-manifest.json"
+)
 
 
 @dataclass(frozen=True)
@@ -56,9 +71,12 @@ class DaemonConfig:
 
         return cls(
             server=_required_env("WAVEFORWARD_DAEMON_SERVER"),
-            auth_user=os.getenv("WAVEFORWARD_DAEMON_USER"),
-            auth_password=os.getenv("WAVEFORWARD_DAEMON_PASSWORD"),
-            auth_token=os.getenv("WAVEFORWARD_DAEMON_TOKEN"),
+            auth_user=os.getenv("WAVEFORWARD_DAEMON_USER")
+            or os.getenv("WAVEFORWARD_AUTH_USER"),
+            auth_password=os.getenv("WAVEFORWARD_DAEMON_PASSWORD")
+            or os.getenv("WAVEFORWARD_AUTH_PASSWORD"),
+            auth_token=os.getenv("WAVEFORWARD_DAEMON_TOKEN")
+            or os.getenv("WAVEFORWARD_AUTH_TOKEN"),
             machine_name=os.getenv("WAVEFORWARD_DAEMON_MACHINE"),
             poll_interval=float(os.getenv("WAVEFORWARD_DAEMON_INTERVAL", "2.0")),
             request_retries=_env_positive_int("WAVEFORWARD_DAEMON_REQUEST_RETRIES", 3),
@@ -301,7 +319,44 @@ def _process_job(
 ) -> None:
     job_id = job["id"]
     agent = str(job["agent"])
+    model = str(job.get("model") or "")
+    reasoning_effort = str(job.get("reasoning_effort") or "")
     machine_name = str(machine.get("name") or job.get("machine") or "daemon")
+    job_payload = dict(job.get("job") or {})
+    model = model or str(job_payload.get("model") or "")
+    reasoning_effort = reasoning_effort or str(
+        job_payload.get("reasoning_effort") or ""
+    )
+    job_kind = str(job_payload.get("kind") or "conversation_turn")
+    if job_kind == "session_import_scan":
+        _process_session_import_scan(
+            client,
+            root,
+            machine=machine,
+            job=job,
+            payload=job_payload,
+        )
+        return
+    if job_kind == "session_import_import":
+        _process_session_import_import(
+            client,
+            root,
+            machine=machine,
+            job=job,
+            payload=job_payload,
+            machine_name=machine_name,
+        )
+        return
+    if job_kind.startswith("workspace_"):
+        _process_workspace_file_job(
+            client,
+            root,
+            machine=machine,
+            job=job,
+            payload=job_payload,
+        )
+        return
+
     conversation = job["conversation"]
     save_conversation(root, conversation)
 
@@ -320,6 +375,8 @@ def _process_job(
             conversation["id"],
             agent=agent,
             machine=machine_name,
+            model=model,
+            reasoning_effort=reasoning_effort,
             execute_agent=bool(job.get("execute_agent", True)),
             on_output=post_output,
         )
@@ -341,6 +398,155 @@ def _process_job(
             "machine_id": machine["id"],
             "conversation": turn.conversation,
             "agent_run": _agent_run_payload(turn.agent_run),
+        },
+    )
+
+
+def _process_session_import_scan(
+    client: CloudClient,
+    root: Path,
+    *,
+    machine: dict[str, Any],
+    job: dict[str, Any],
+    payload: dict[str, Any],
+) -> None:
+    job_id = job["id"]
+    try:
+        candidates = discover_agent_sessions(
+            limit=_payload_positive_int(
+                payload.get("limit"),
+                default=DEFAULT_HISTORY_LIMIT,
+            ),
+            sources=list(payload.get("sources") or []),
+        )
+    except Exception as error:
+        _post_job_completion(
+            client,
+            f"/api/daemon/jobs/{job_id}/complete",
+            {"machine_id": machine["id"], "error": str(error)},
+        )
+        return
+    _post_job_completion(
+        client,
+        f"/api/daemon/jobs/{job_id}/complete",
+        {
+            "machine_id": machine["id"],
+            "agent_run": {
+                "agent": "session-import",
+                "returncode": 0,
+                "output": f"Found {len(candidates)} importable sessions.",
+                "candidates": candidates,
+            },
+        },
+    )
+
+
+def _process_session_import_import(
+    client: CloudClient,
+    root: Path,
+    *,
+    machine: dict[str, Any],
+    job: dict[str, Any],
+    payload: dict[str, Any],
+    machine_name: str,
+) -> None:
+    job_id = job["id"]
+    candidate_ids = [
+        str(item).strip()
+        for item in payload.get("candidate_ids") or []
+        if str(item).strip()
+    ]
+    try:
+        conversations = import_agent_sessions(
+            root,
+            candidate_ids,
+            machine=machine_name,
+        )
+    except Exception as error:
+        _post_job_completion(
+            client,
+            f"/api/daemon/jobs/{job_id}/complete",
+            {"machine_id": machine["id"], "error": str(error)},
+        )
+        return
+    _post_job_completion(
+        client,
+        f"/api/daemon/jobs/{job_id}/complete",
+        {
+            "machine_id": machine["id"],
+            "imported_conversations": conversations,
+            "agent_run": {
+                "agent": "session-import",
+                "returncode": 0,
+                "output": f"Imported {len(conversations)} sessions.",
+                "imported": [
+                    {
+                        "id": item["id"],
+                        "title": item["title"],
+                        "message_count": len(item.get("messages") or []),
+                    }
+                    for item in conversations
+                ],
+            },
+        },
+    )
+
+
+def _process_workspace_file_job(
+    client: CloudClient,
+    root: Path,
+    *,
+    machine: dict[str, Any],
+    job: dict[str, Any],
+    payload: dict[str, Any],
+) -> None:
+    job_id = job["id"]
+    job_kind = str(payload.get("kind") or "")
+    path = str(payload.get("path") or "")
+    try:
+        if job_kind == "workspace_tree":
+            result_key = "tree"
+            result = list_workspace_tree(root, path=path)
+            output = f"Listed {len(result.get('entries') or [])} workspace entries."
+        elif job_kind == "workspace_file_read":
+            result_key = "file"
+            result = read_workspace_file(root, path=path)
+            output = f"Opened {result['path']}."
+        elif job_kind == "workspace_file_write":
+            result_key = "file"
+            result = write_workspace_file(
+                root,
+                path=path,
+                content=str(payload.get("content") or ""),
+                base_sha256=_payload_optional_string(payload.get("base_sha256")),
+                create=bool(payload.get("create", False)),
+            )
+            output = f"Saved {result['path']}."
+        elif job_kind == "workspace_file_diff":
+            result_key = "diff"
+            result = workspace_file_diff(root, path=path)
+            output = f"Prepared diff for {result['path']}."
+        else:
+            raise AgentSyncError("Unknown workspace file job.")
+    except Exception as error:
+        _post_job_completion(
+            client,
+            f"/api/daemon/jobs/{job_id}/complete",
+            {"machine_id": machine["id"], "error": str(error)},
+        )
+        return
+
+    _post_job_completion(
+        client,
+        f"/api/daemon/jobs/{job_id}/complete",
+        {
+            "machine_id": machine["id"],
+            "agent_run": {
+                "agent": "workspace-files",
+                "returncode": 0,
+                "output": output,
+                result_key: result,
+            },
         },
     )
 
@@ -374,6 +580,8 @@ def _agent_run_payload(item: AgentRunResult | None) -> dict[str, Any] | None:
         "command": list(item.command),
         "returncode": item.returncode,
         "output": item.output,
+        "model": item.model,
+        "reasoning_effort": item.reasoning_effort,
     }
 
 
@@ -385,6 +593,7 @@ def _daemon_runtime_payload(
     config: DaemonConfig,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
+        "capabilities": ["session_import", "workspace_files"],
         "platform": platform.platform(),
         "python": platform.python_version(),
         "version": __version__,
@@ -424,7 +633,7 @@ def _daemon_update_payload(
         return dict(cached)
 
     headers = {}
-    if client.auth_header:
+    if client.auth_header and _same_origin(manifest, client.server):
         headers["Authorization"] = client.auth_header
     try:
         result = check_for_update(
@@ -463,7 +672,7 @@ def _daemon_update_manifest_url(client: CloudClient, config: DaemonConfig) -> st
     configured = (config.update_manifest_url or "").strip()
     if configured:
         return configured
-    return urljoin(client.server, "api/releases/waveforward-release-manifest.json")
+    return PUBLIC_RELEASE_MANIFEST_URL
 
 
 def _load_or_create_daemon_state(root: Path) -> dict[str, Any]:
@@ -587,6 +796,30 @@ def _env_positive_int(name: str, default: int) -> int:
     except ValueError as error:
         raise AgentSyncError(f"{name} must be an integer.") from error
     return max(parsed, 1)
+
+
+def _payload_positive_int(value: Any, default: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return max(parsed, 1)
+
+
+def _payload_optional_string(value: Any) -> str | None:
+    text = str(value or "").strip()
+    return text or None
+
+
+def _same_origin(left: str, right: str) -> bool:
+    left_url = urlparse(left)
+    right_url = urlparse(right)
+    return bool(
+        left_url.scheme
+        and right_url.scheme
+        and left_url.scheme == right_url.scheme
+        and left_url.netloc == right_url.netloc
+    )
 
 
 def _request_retry_delay(attempt: int) -> float:

@@ -15,16 +15,21 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from waveforward.daemon import (  # noqa: E402
+    PUBLIC_RELEASE_MANIFEST_URL,
     UNSAFE_AGENT_EXECUTION_ENV,
     CloudClient,
     DaemonConfig,
+    _daemon_runtime_payload,
+    _daemon_update_manifest_url,
     _daemon_update_payload,
     _load_or_create_daemon_state,
     _post_job_completion,
+    _process_job,
     _save_daemon_state,
     daemon_status,
     start_daemon_process,
 )
+from waveforward.files import read_workspace_file  # noqa: E402
 
 
 class _FakeResponse:
@@ -79,6 +84,18 @@ class _CompletionClient:
             from waveforward.core import AgentSyncError
 
             raise AgentSyncError("Cloud request failed: 502")
+        return {"ok": True}
+
+
+class _RecordingClient:
+    auth_header = "Bearer machine-token"
+    server = "https://app.example.test/"
+
+    def __init__(self) -> None:
+        self.posts: list[tuple[str, dict[str, object]]] = []
+
+    def post(self, path: str, payload: dict[str, object]) -> dict[str, object]:
+        self.posts.append((path, payload))
         return {"ok": True}
 
 
@@ -272,6 +289,112 @@ class DaemonClientTests(unittest.TestCase):
             self.assertTrue(result["configured"])
             self.assertFalse(result["verified"])
             self.assertEqual(result["reason"], "update check failed")
+
+    def test_daemon_update_defaults_to_public_manifest(self) -> None:
+        client = CloudClient(DaemonConfig(server="https://app.example.test"))
+
+        manifest = _daemon_update_manifest_url(
+            client,
+            DaemonConfig(server="https://app.example.test"),
+        )
+
+        self.assertEqual(manifest, PUBLIC_RELEASE_MANIFEST_URL)
+
+    def test_daemon_runtime_reports_import_and_file_capabilities(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / ".waveforward").mkdir()
+            client = CloudClient(DaemonConfig(server="https://app.example.test"))
+            config = DaemonConfig(server="https://app.example.test")
+
+            with patch("waveforward.daemon.check_for_update") as check:
+                check.return_value.current_commit = ""
+                check.return_value.current_version = "0.1.2"
+                check.return_value.latest_commit = ""
+                check.return_value.latest_version = "0.1.2"
+                check.return_value.reason = "current"
+                check.return_value.update_available = False
+                check.return_value.verified = True
+                payload = _daemon_runtime_payload(
+                    client,
+                    root,
+                    {"machine_id": "machine_alpha"},
+                    config=config,
+                )
+
+            self.assertEqual(
+                payload["capabilities"], ["session_import", "workspace_files"]
+            )
+            self.assertEqual(check.call_args.kwargs["headers"], {})
+
+    def test_workspace_file_job_reads_remote_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "remote.py").write_text("print('remote')\n", encoding="utf-8")
+            client = _RecordingClient()
+            machine = {"id": "machine-test", "name": "Remote machine"}
+            job = {
+                "agent": "codex",
+                "id": "run-file",
+                "job": {"kind": "workspace_file_read", "path": "remote.py"},
+            }
+
+            _process_job(client, root, machine=machine, job=job)
+
+            path, payload = client.posts[-1]
+            self.assertEqual(path, "/api/daemon/jobs/run-file/complete")
+            self.assertEqual(payload["agent_run"]["agent"], "workspace-files")
+            self.assertEqual(
+                payload["agent_run"]["file"]["content"],
+                "print('remote')\n",
+            )
+
+    def test_workspace_file_job_writes_remote_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / "remote.py"
+            target.write_text("print('before')\n", encoding="utf-8")
+            file_payload = read_workspace_file(root, path="remote.py")
+            client = _RecordingClient()
+            machine = {"id": "machine-test", "name": "Remote machine"}
+            job = {
+                "agent": "codex",
+                "id": "run-file",
+                "job": {
+                    "base_sha256": file_payload["sha256"],
+                    "content": "print('after')\n",
+                    "kind": "workspace_file_write",
+                    "path": "remote.py",
+                },
+            }
+
+            _process_job(client, root, machine=machine, job=job)
+
+            self.assertEqual(target.read_text(encoding="utf-8"), "print('after')\n")
+            _path, payload = client.posts[-1]
+            self.assertEqual(
+                payload["agent_run"]["file"]["content"], "print('after')\n"
+            )
+
+    def test_session_import_scan_job_posts_candidates(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            client = _RecordingClient()
+            machine = {"id": "machine-test", "name": "Remote machine"}
+            job = {
+                "agent": "codex",
+                "id": "run-import",
+                "job": {"kind": "session_import_scan", "limit": 10},
+            }
+
+            with patch(
+                "waveforward.daemon.discover_agent_sessions",
+                return_value=[{"id": "codex-1", "title": "Imported"}],
+            ):
+                _process_job(client, Path(tmp), machine=machine, job=job)
+
+            _path, payload = client.posts[-1]
+            self.assertEqual(payload["agent_run"]["agent"], "session-import")
+            self.assertEqual(payload["agent_run"]["candidates"][0]["id"], "codex-1")
 
     def test_job_completion_retries_transient_cloud_errors(self) -> None:
         client = _CompletionClient(failures=2)
