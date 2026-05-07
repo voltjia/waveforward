@@ -5,6 +5,7 @@ from __future__ import annotations
 import inspect
 import json
 import platform
+import shlex
 import shutil
 import tomllib
 import uuid
@@ -55,6 +56,14 @@ class ConversationTurnResult:
 
 
 @dataclass(frozen=True)
+class SlashCommandResult:
+    """A completed WaveForward-native slash command."""
+
+    conversation: dict[str, Any]
+    command: dict[str, Any]
+
+
+@dataclass(frozen=True)
 class ContinuationBundleResult:
     """An exported continuation bundle."""
 
@@ -81,6 +90,8 @@ class AgentRunner(Protocol):
         *,
         agent: str,
         prompt: str,
+        model: str | None = None,
+        reasoning_effort: str | None = None,
         on_output: OutputCallback | None = None,
     ) -> AgentRunResult:
         """Run an agent command."""
@@ -92,7 +103,10 @@ def create_conversation(
     title: str = "",
     agent: str = DEFAULT_AGENT,
     machine: str = DEFAULT_MACHINE,
+    model: str | None = None,
+    reasoning_effort: str | None = None,
     owner: str | None = None,
+    workspace: str | None = None,
 ) -> dict[str, Any]:
     """Create a user-visible WaveForward conversation."""
 
@@ -100,13 +114,14 @@ def create_conversation(
     initialize_workspace(root)
     now = utc_now()
     clean_owner = _clean_owner(owner)
+    workspace_value = str(workspace or "").strip()
     conversation = {
         "version": CONVERSATION_VERSION,
         "id": _build_id("conv"),
         "title": title.strip() or "New session",
         "created_at": now,
         "updated_at": now,
-        "workspace": str(root.resolve()),
+        "workspace": workspace_value or str(root.resolve()),
         "preferred": {
             "agent": agent.strip() or DEFAULT_AGENT,
             "machine": machine.strip() or DEFAULT_MACHINE,
@@ -114,6 +129,11 @@ def create_conversation(
         "messages": [],
         "continuations": [],
     }
+    _set_route_options(
+        conversation["preferred"],
+        model=model,
+        reasoning_effort=reasoning_effort,
+    )
     if clean_owner:
         conversation["owner"] = clean_owner
     _write_conversation(root, conversation)
@@ -268,6 +288,8 @@ def add_message(
     content: str,
     agent: str | None = None,
     machine: str | None = None,
+    model: str | None = None,
+    reasoning_effort: str | None = None,
     owner: str | None = None,
 ) -> dict[str, Any]:
     """Append a message to a WaveForward conversation."""
@@ -291,10 +313,138 @@ def add_message(
         message["agent"] = agent
     if machine:
         message["machine"] = machine
+    if model:
+        message["model"] = model
+    if reasoning_effort:
+        message["reasoning_effort"] = reasoning_effort
     conversation["messages"].append(message)
     conversation["updated_at"] = now
     _write_conversation(root, conversation)
     return conversation
+
+
+def execute_slash_command(
+    start: Path | str,
+    conversation_id: str,
+    *,
+    content: str,
+    agent: str | None = None,
+    machine: str | None = None,
+    model: str | None = None,
+    reasoning_effort: str | None = None,
+    status: dict[str, Any] | None = None,
+    owner: str | None = None,
+) -> SlashCommandResult:
+    """Execute one WaveForward-native slash command in a conversation."""
+
+    root = Path(start)
+    parsed = _parse_slash_command(content)
+    if parsed is None:
+        raise ValueError("Slash command must start with /.")
+    name, args = parsed
+    conversation = add_message(
+        root,
+        conversation_id,
+        role="user",
+        content=content,
+        agent=agent,
+        machine=machine,
+        model=model,
+        reasoning_effort=reasoning_effort,
+        owner=owner,
+    )
+    preferred = conversation.get("preferred", {})
+    active_agent = str(agent or preferred.get("agent") or DEFAULT_AGENT)
+    active_machine = str(machine or preferred.get("machine") or DEFAULT_MACHINE)
+    active_model = model if model is not None else preferred.get("model")
+    active_reasoning = (
+        reasoning_effort
+        if reasoning_effort is not None
+        else preferred.get("reasoning_effort")
+    )
+    context_status = status or service_status(root, owner=owner)
+    command = {
+        "name": name,
+        "args": args,
+        "route": {
+            "agent": active_agent,
+            "machine": active_machine,
+            "model": str(active_model or ""),
+            "reasoning_effort": str(active_reasoning or ""),
+        },
+    }
+
+    if name in {"help", "h", "?"}:
+        output = _slash_help()
+    elif name in {"sessions", "session"}:
+        output = _slash_sessions(context_status)
+    elif name in {"machines", "machine"}:
+        output = _slash_machines(context_status)
+    elif name in {"agents", "agent"}:
+        output = _slash_agents(context_status)
+    elif name == "model":
+        route, output = _slash_model(
+            args,
+            agent=active_agent,
+            machine=active_machine,
+            model=str(active_model or ""),
+            reasoning_effort=str(active_reasoning or ""),
+        )
+        command["route"] = route
+        conversation = _set_preferred_route(
+            root,
+            conversation,
+            agent=route["agent"],
+            machine=route["machine"],
+            model=route["model"],
+            reasoning_effort=route["reasoning_effort"],
+        )
+    elif name == "archive":
+        output = "Session archived."
+        conversation = archive_conversation(
+            root,
+            conversation_id,
+            archived=True,
+            owner=owner,
+        )
+        command["archived"] = True
+    elif name == "rename":
+        title = " ".join(args).strip()
+        if not title:
+            output = "Usage: /rename New session title"
+            command["error"] = "missing_title"
+        else:
+            conversation = rename_conversation(
+                root,
+                conversation_id,
+                title=title,
+                owner=owner,
+            )
+            output = f"Session renamed to: {title}"
+            command["title"] = title
+    else:
+        output = f"Unknown command: /{name}\n\n{_slash_help()}"
+        command["error"] = "unknown_command"
+
+    conversation = add_message(
+        root,
+        conversation_id,
+        role="service",
+        content=output,
+        agent=command["route"]["agent"],
+        machine=command["route"]["machine"],
+        model=command["route"].get("model") or None,
+        reasoning_effort=command["route"].get("reasoning_effort") or None,
+        owner=owner,
+    )
+    if command.get("archived"):
+        conversation = archive_conversation(
+            root,
+            conversation_id,
+            archived=True,
+            owner=owner,
+        )
+    return SlashCommandResult(conversation=conversation, command=command)
 
 
 def prepare_continuation(
@@ -358,6 +508,8 @@ def run_conversation_turn(
     content: str,
     agent: str | None = None,
     machine: str | None = None,
+    model: str | None = None,
+    reasoning_effort: str | None = None,
     execute_agent: bool = True,
     agent_runner: AgentRunner = run_agent,
     on_output: OutputCallback | None = None,
@@ -373,6 +525,8 @@ def run_conversation_turn(
         content=content,
         agent=agent,
         machine=machine,
+        model=model,
+        reasoning_effort=reasoning_effort,
         owner=owner,
     )
     return complete_conversation_turn(
@@ -380,6 +534,8 @@ def run_conversation_turn(
         conversation_id,
         agent=agent,
         machine=machine,
+        model=model,
+        reasoning_effort=reasoning_effort,
         execute_agent=execute_agent,
         agent_runner=agent_runner,
         on_output=on_output,
@@ -394,6 +550,8 @@ def complete_conversation_turn(
     *,
     agent: str | None = None,
     machine: str | None = None,
+    model: str | None = None,
+    reasoning_effort: str | None = None,
     execute_agent: bool = True,
     agent_runner: AgentRunner = run_agent,
     on_output: OutputCallback | None = None,
@@ -409,11 +567,21 @@ def complete_conversation_turn(
         _ensure_owner(conversation, owner, "conversation")
     destination_agent = agent or conversation["preferred"]["agent"]
     destination_machine = machine or conversation["preferred"]["machine"]
+    destination_model = (
+        model if model is not None else conversation.get("preferred", {}).get("model")
+    )
+    destination_reasoning = (
+        reasoning_effort
+        if reasoning_effort is not None
+        else conversation.get("preferred", {}).get("reasoning_effort")
+    )
     conversation = _set_preferred_route(
         root,
         conversation,
         agent=destination_agent,
         machine=destination_machine,
+        model=destination_model,
+        reasoning_effort=destination_reasoning,
     )
     agent_run = None
     if execute_agent:
@@ -421,11 +589,15 @@ def complete_conversation_turn(
             conversation,
             agent=destination_agent,
             machine=destination_machine,
+            model=destination_model,
+            reasoning_effort=destination_reasoning,
         )
         agent_run = _run_agent_runner(
             agent_runner,
             root,
             agent=destination_agent,
+            model=destination_model,
+            reasoning_effort=destination_reasoning,
             prompt=prompt,
             on_output=on_output,
         )
@@ -436,6 +608,8 @@ def complete_conversation_turn(
             content=agent_run.output or f"{destination_agent} completed the turn.",
             agent=destination_agent,
             machine=destination_machine,
+            model=destination_model,
+            reasoning_effort=destination_reasoning,
             owner=owner,
         )
 
@@ -554,17 +728,214 @@ def service_status(
     }
 
 
+def _parse_slash_command(content: str) -> tuple[str, list[str]] | None:
+    text = content.strip()
+    if not text.startswith("/") or text.startswith("//"):
+        return None
+    body = text[1:].strip()
+    if not body:
+        return "help", []
+    try:
+        parts = shlex.split(body)
+    except ValueError as error:
+        raise ValueError(f"Could not parse slash command: {error}") from error
+    if not parts:
+        return "help", []
+    return parts[0].lower(), parts[1:]
+
+
+def _slash_help() -> str:
+    return "\n".join(
+        [
+            "WaveForward commands",
+            "/help - Show available commands.",
+            "/sessions - List recent active and archived sessions.",
+            "/machines - List connected machines.",
+            "/agents - List available agents.",
+            "/model [model] [effort] - Set or show the current route model.",
+            "/archive - Archive this session.",
+            "/rename <title> - Rename this session.",
+            "",
+            "Use // at the start of a message to send a literal slash command "
+            "to the agent.",
+        ]
+    )
+
+
+def _slash_sessions(status: dict[str, Any]) -> str:
+    active = list(status.get("conversations") or [])
+    archived = list(status.get("archived_conversations") or [])
+    lines = [
+        f"Sessions: {len(active)} active, {len(archived)} archived.",
+    ]
+    if active:
+        lines.append("")
+        lines.append("Active")
+        lines.extend(_format_session_summary(item) for item in active[:12])
+    if archived:
+        lines.append("")
+        lines.append("Archived")
+        lines.extend(_format_session_summary(item) for item in archived[:8])
+    if not active and not archived:
+        lines.append("No sessions yet.")
+    return "\n".join(lines)
+
+
+def _slash_machines(status: dict[str, Any]) -> str:
+    lines = [
+        f"Service machine: {status.get('machine') or DEFAULT_MACHINE}",
+        f"Workspace: {status.get('workspace') or '-'}",
+    ]
+    machines = list(status.get("daemon_machines") or [])
+    environments = list(status.get("environments") or [])
+    if machines:
+        lines.append("")
+        lines.append("Connected machines")
+        for machine in machines[:12]:
+            name = machine.get("name") or machine.get("id") or "Machine"
+            state = "online" if machine.get("online") else "offline"
+            workspace = machine.get("workspace") or "workspace unknown"
+            lines.append(f"- {name}: {state}, {workspace}")
+    if environments:
+        lines.append("")
+        lines.append("Saved environments")
+        for environment in environments[:12]:
+            name = environment.get("name") or "Environment"
+            endpoint = environment.get("endpoint") or environment.get("ssh_host") or "-"
+            lines.append(f"- {name}: {endpoint}")
+    if not machines and not environments:
+        lines.append("")
+        lines.append("No remote machines are connected yet.")
+    return "\n".join(lines)
+
+
+def _slash_agents(status: dict[str, Any]) -> str:
+    lines = ["Agents"]
+    local_agents = list(status.get("agents") or [])
+    if local_agents:
+        lines.append("")
+        lines.append("This service")
+        lines.extend(_format_agent_summary(item) for item in local_agents)
+    for machine in list(status.get("daemon_machines") or [])[:12]:
+        agents = list(machine.get("agents") or [])
+        if not agents:
+            continue
+        lines.append("")
+        lines.append(str(machine.get("name") or machine.get("id") or "Machine"))
+        lines.extend(_format_agent_summary(item) for item in agents)
+    if len(lines) == 1:
+        lines.append("No agent information is available yet.")
+    return "\n".join(lines)
+
+
+def _slash_model(
+    args: list[str],
+    *,
+    agent: str,
+    machine: str,
+    model: str,
+    reasoning_effort: str,
+) -> tuple[dict[str, str], str]:
+    efforts = {"low", "medium", "high", "xhigh"}
+    clean_args = [item.strip() for item in args if item.strip()]
+    next_model = model
+    next_effort = reasoning_effort
+    if not clean_args:
+        route = {
+            "agent": agent,
+            "machine": machine,
+            "model": next_model,
+            "reasoning_effort": next_effort,
+        }
+        return route, _format_model_route(route)
+    if len(clean_args) == 1 and clean_args[0].lower() in efforts:
+        next_effort = clean_args[0].lower()
+    elif len(clean_args) == 1 and clean_args[0].lower() == "default":
+        next_model = ""
+        next_effort = ""
+    else:
+        next_model = "" if clean_args[0].lower() == "default" else clean_args[0]
+        if len(clean_args) >= 2:
+            effort = clean_args[1].lower()
+            if effort not in efforts and effort != "default":
+                route = {
+                    "agent": agent,
+                    "machine": machine,
+                    "model": model,
+                    "reasoning_effort": reasoning_effort,
+                }
+                return (
+                    route,
+                    "Usage: /model [model] [low|medium|high|xhigh]\n"
+                    "Use /model default to clear model and effort.",
+                )
+            next_effort = "" if effort == "default" else effort
+    route = {
+        "agent": agent,
+        "machine": machine,
+        "model": next_model,
+        "reasoning_effort": next_effort,
+    }
+    return route, f"Model route updated.\n\n{_format_model_route(route)}"
+
+
+def _format_model_route(route: dict[str, str]) -> str:
+    return "\n".join(
+        [
+            f"Agent: {route.get('agent') or DEFAULT_AGENT}",
+            f"Machine: {route.get('machine') or DEFAULT_MACHINE}",
+            f"Model: {route.get('model') or 'default'}",
+            f"Effort: {route.get('reasoning_effort') or 'default'}",
+        ]
+    )
+
+
+def _format_session_summary(item: dict[str, Any]) -> str:
+    preferred = item.get("preferred") or {}
+    route = " / ".join(
+        part
+        for part in (
+            str(preferred.get("agent") or ""),
+            str(preferred.get("machine") or ""),
+        )
+        if part
+    )
+    workspace = item.get("workspace_name") or _workspace_name(
+        str(item.get("workspace") or "")
+    )
+    count = int(item.get("message_count") or 0)
+    title = item.get("title") or "New session"
+    suffix = f" - {route}" if route else ""
+    return f"- {title} ({workspace}, {count} messages){suffix}"
+
+
+def _format_agent_summary(item: dict[str, Any]) -> str:
+    state = "available" if item.get("available") else "unavailable"
+    label = item.get("label") or item.get("id") or "agent"
+    models = [
+        str(option.get("value") or "").strip()
+        for option in item.get("model_options") or []
+        if str(option.get("value") or "").strip()
+    ]
+    model_text = f"; models: {', '.join(models[:4])}" if models else ""
+    return f"- {label}: {state}{model_text}"
+
+
 def _render_service_context(
     conversation: dict[str, Any],
     *,
     agent: str,
     machine: str,
+    model: str | None = None,
+    reasoning_effort: str | None = None,
 ) -> str:
     lines = [
         "Continue the WaveForward conversation below.",
         f"Conversation: {conversation['title']}",
         f"Destination agent: {agent}",
         f"Destination machine: {machine}",
+        f"Destination model: {model or 'default'}",
+        f"Destination reasoning effort: {reasoning_effort or 'default'}",
         "",
         "Canonical transcript:",
     ]
@@ -581,12 +952,16 @@ def _render_agent_prompt(
     *,
     agent: str,
     machine: str,
+    model: str | None = None,
+    reasoning_effort: str | None = None,
 ) -> str:
     lines = [
         "You are running inside a WaveForward-managed conversation.",
         f"Conversation: {conversation['title']}",
         f"Agent: {agent}",
         f"Machine: {machine}",
+        f"Model: {model or 'default'}",
+        f"Reasoning effort: {reasoning_effort or 'default'}",
         "",
         "Use the transcript below as the canonical chat context. Continue the",
         "same conversation and respond to the latest user message.",
@@ -611,15 +986,26 @@ def _render_agent_prompt(
 def _conversation_summary(item: dict[str, Any]) -> dict[str, Any]:
     messages = item.get("messages", [])
     continuations = item.get("continuations", [])
+    workspace = str(item.get("workspace") or "")
     return {
         "id": item.get("id", ""),
         "title": item.get("title", "New session"),
         "updated_at": item.get("updated_at", ""),
+        "workspace": workspace,
+        "workspace_name": _workspace_name(workspace),
         "message_count": len(messages),
         "continuation_count": len(continuations),
         "preferred": item.get("preferred", {}),
         "archived_at": item.get("archived_at"),
     }
+
+
+def _workspace_name(workspace: str) -> str:
+    clean = workspace.strip().replace("\\", "/").rstrip("/")
+    if not clean:
+        return "No workspace"
+    parts = [part for part in clean.split("/") if part]
+    return parts[-1] if parts else clean
 
 
 def _set_preferred_route(
@@ -628,8 +1014,11 @@ def _set_preferred_route(
     *,
     agent: str,
     machine: str,
+    model: str | None = None,
+    reasoning_effort: str | None = None,
 ) -> dict[str, Any]:
     preferred = {"agent": agent, "machine": machine}
+    _set_route_options(preferred, model=model, reasoning_effort=reasoning_effort)
     if conversation.get("preferred") == preferred:
         return conversation
     conversation = {**conversation, "preferred": preferred, "updated_at": utc_now()}
@@ -688,22 +1077,50 @@ def _run_agent_runner(
     root: Path,
     *,
     agent: str,
+    model: str | None,
+    reasoning_effort: str | None,
     prompt: str,
     on_output: OutputCallback | None,
 ) -> AgentRunResult:
-    if on_output is None or not _runner_accepts_output(agent_runner):
-        return agent_runner(root, agent=agent, prompt=prompt)
-    return agent_runner(root, agent=agent, prompt=prompt, on_output=on_output)
+    kwargs: dict[str, Any] = {"agent": agent, "prompt": prompt}
+    if model and _runner_accepts_parameter(agent_runner, "model"):
+        kwargs["model"] = model
+    if reasoning_effort and _runner_accepts_parameter(
+        agent_runner,
+        "reasoning_effort",
+    ):
+        kwargs["reasoning_effort"] = reasoning_effort
+    if on_output is not None and _runner_accepts_parameter(agent_runner, "on_output"):
+        kwargs["on_output"] = on_output
+    return agent_runner(root, **kwargs)
 
 
 def _runner_accepts_output(agent_runner: AgentRunner) -> bool:
+    return _runner_accepts_parameter(agent_runner, "on_output")
+
+
+def _runner_accepts_parameter(agent_runner: AgentRunner, name: str) -> bool:
     try:
         parameters = inspect.signature(agent_runner).parameters
     except (TypeError, ValueError):
         return True
-    return "on_output" in parameters or any(
+    return name in parameters or any(
         item.kind is inspect.Parameter.VAR_KEYWORD for item in parameters.values()
     )
+
+
+def _set_route_options(
+    target: dict[str, Any],
+    *,
+    model: str | None,
+    reasoning_effort: str | None,
+) -> None:
+    clean_model = str(model or "").strip()
+    clean_reasoning = str(reasoning_effort or "").strip()
+    if clean_model:
+        target["model"] = clean_model
+    if clean_reasoning:
+        target["reasoning_effort"] = clean_reasoning
 
 
 def _service_machine_name(root: Path) -> str:

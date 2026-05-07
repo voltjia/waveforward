@@ -76,9 +76,9 @@ commands inside user-selected workspaces. Treat daemon tokens and
 `.waveforward` state, API keys, agent credentials, or release artifacts that
 should not be public.
 
-Agent execution that uses automatic edit or permission-bypass modes requires an
-explicit local opt-in. The app-generated `waveforward daemon-start` command
-includes this opt-in for the selected workspace:
+Agent execution may use automatic edit or permission-bypass modes depending on
+the selected agent. The app-generated `waveforward daemon-start` command includes
+an explicit local acknowledgement for the selected workspace:
 
 ```bash
 waveforward daemon-start --allow-agent-execution ...

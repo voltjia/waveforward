@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import os
+import json
 import re
 import shutil
 import subprocess
@@ -18,12 +18,32 @@ DEFAULT_OPENCODE_MODEL = "opencode/minimax-m2.5-free"
 MAX_AGENT_OUTPUT_CHARS = 6000
 ANSI_PATTERN = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 OutputCallback = Callable[[str], None]
+REASONING_EFFORTS = ("low", "medium", "high", "xhigh")
 AGENT_COMMANDS = {
     "claude-code": ("Claude Code", "claude"),
     "codex": ("Codex", "codex"),
     "opencode": ("OpenCode", "opencode"),
 }
-UNSAFE_AGENT_EXECUTION_ENV = "WAVEFORWARD_ALLOW_UNSAFE_AGENT_EXECUTION"
+AGENT_MODEL_OPTIONS = {
+    "claude-code": (
+        {"value": "", "label": "Default"},
+        {"value": "opus", "label": "Opus"},
+        {"value": "sonnet", "label": "Sonnet"},
+    ),
+    "codex": (
+        {"value": "", "label": "Default"},
+        {"value": "gpt-5.5", "label": "GPT-5.5"},
+        {"value": "gpt-5.4", "label": "GPT-5.4"},
+        {"value": "gpt-5.4-mini", "label": "GPT-5.4 Mini"},
+        {"value": "gpt-5.3-codex", "label": "GPT-5.3 Codex"},
+        {"value": "gpt-5.3-codex-spark", "label": "GPT-5.3 Codex Spark"},
+        {"value": "gpt-5.2", "label": "GPT-5.2"},
+    ),
+    "opencode": (
+        {"value": DEFAULT_OPENCODE_MODEL, "label": "Minimax M2.5 Free"},
+        {"value": "", "label": "Default"},
+    ),
+}
 
 
 @dataclass(frozen=True)
@@ -34,6 +54,8 @@ class AgentRunResult:
     command: tuple[str, ...]
     returncode: int
     output: str
+    model: str | None = None
+    reasoning_effort: str | None = None
 
 
 def run_agent(
@@ -41,17 +63,37 @@ def run_agent(
     *,
     agent: str,
     prompt: str,
+    model: str | None = None,
+    reasoning_effort: str | None = None,
     on_output: OutputCallback | None = None,
 ) -> AgentRunResult:
     """Run a supported local agent for a WaveForward conversation turn."""
 
     normalized = agent.lower().strip()
     if normalized in {"claude", "claude-code"}:
-        return run_claude_code(root, prompt=prompt, on_output=on_output)
+        return run_claude_code(
+            root,
+            prompt=prompt,
+            model=model,
+            reasoning_effort=reasoning_effort,
+            on_output=on_output,
+        )
     if normalized == "codex":
-        return run_codex(root, prompt=prompt, on_output=on_output)
+        return run_codex(
+            root,
+            prompt=prompt,
+            model=model,
+            reasoning_effort=reasoning_effort,
+            on_output=on_output,
+        )
     if normalized == "opencode":
-        return run_opencode(root, prompt=prompt, on_output=on_output)
+        return run_opencode(
+            root,
+            prompt=prompt,
+            model=model or DEFAULT_OPENCODE_MODEL,
+            reasoning_effort=reasoning_effort,
+            on_output=on_output,
+        )
     raise AgentSyncError(f"Agent runner is not available yet: {agent}")
 
 
@@ -64,6 +106,10 @@ def agent_capabilities() -> list[dict[str, Any]]:
             "label": label,
             "command": command,
             "available": shutil.which(command) is not None,
+            "model_options": list(AGENT_MODEL_OPTIONS.get(agent, ())),
+            "reasoning_options": list(REASONING_EFFORTS),
+            "supports_custom_model": True,
+            "supports_reasoning_effort": agent == "codex",
         }
         for agent, (label, command) in AGENT_COMMANDS.items()
     ]
@@ -73,12 +119,14 @@ def run_claude_code(
     root: Path,
     *,
     prompt: str,
+    model: str | None = None,
+    reasoning_effort: str | None = None,
     on_output: OutputCallback | None = None,
 ) -> AgentRunResult:
     """Run Claude Code non-interactively in a workspace."""
 
     _require_agent_command("claude-code")
-    _require_unsafe_agent_execution("Claude Code")
+    model_args = ("--model", model.strip()) if model and model.strip() else ()
     command = (
         "claude",
         "--print",
@@ -86,6 +134,7 @@ def run_claude_code(
         "acceptEdits",
         "--output-format",
         "text",
+        *model_args,
         prompt,
     )
     returncode, output = _run_command(root, command, on_output=on_output)
@@ -98,6 +147,8 @@ def run_claude_code(
         command=command,
         returncode=returncode,
         output=output,
+        model=model.strip() if model and model.strip() else None,
+        reasoning_effort=_clean_reasoning_effort(reasoning_effort),
     )
 
 
@@ -105,17 +156,25 @@ def run_codex(
     root: Path,
     *,
     prompt: str,
+    model: str | None = None,
+    reasoning_effort: str | None = None,
     on_output: OutputCallback | None = None,
 ) -> AgentRunResult:
     """Run Codex CLI non-interactively in a workspace."""
 
     _require_agent_command("codex")
-    _require_unsafe_agent_execution("Codex")
+    model_args = ("--model", model.strip()) if model and model.strip() else ()
+    effort = _clean_reasoning_effort(reasoning_effort)
+    reasoning_args = (
+        ("-c", f"model_reasoning_effort={json.dumps(effort)}") if effort else ()
+    )
     with tempfile.TemporaryDirectory(prefix="waveforward-codex-") as temp_dir:
         last_message_path = Path(temp_dir) / "last-message.txt"
         command = (
             "codex",
             "exec",
+            *model_args,
+            *reasoning_args,
             "--dangerously-bypass-approvals-and-sandbox",
             "--cd",
             str(root),
@@ -135,6 +194,8 @@ def run_codex(
         command=command,
         returncode=returncode,
         output=output,
+        model=model.strip() if model and model.strip() else None,
+        reasoning_effort=effort,
     )
 
 
@@ -143,12 +204,12 @@ def run_opencode(
     *,
     prompt: str,
     model: str = DEFAULT_OPENCODE_MODEL,
+    reasoning_effort: str | None = None,
     on_output: OutputCallback | None = None,
 ) -> AgentRunResult:
     """Run OpenCode non-interactively in a workspace."""
 
     _require_agent_command("opencode")
-    _require_unsafe_agent_execution("OpenCode")
     command = (
         "opencode",
         "run",
@@ -165,7 +226,14 @@ def run_opencode(
         command=command,
         returncode=returncode,
         output=output,
+        model=model,
+        reasoning_effort=_clean_reasoning_effort(reasoning_effort),
     )
+
+
+def _clean_reasoning_effort(value: str | None) -> str | None:
+    effort = str(value or "").strip().lower()
+    return effort if effort in REASONING_EFFORTS else None
 
 
 def _run_command(
@@ -216,12 +284,3 @@ def _require_agent_command(agent: str) -> None:
         raise AgentSyncError(
             f"{label} is not installed or is not on PATH for this WaveForward service."
         )
-
-
-def _require_unsafe_agent_execution(label: str) -> None:
-    if os.getenv(UNSAFE_AGENT_EXECUTION_ENV, "").strip() == "1":
-        return
-    raise AgentSyncError(
-        f"{label} execution through WaveForward can edit files and run commands. "
-        f"Set {UNSAFE_AGENT_EXECUTION_ENV}=1 to opt in for this workspace."
-    )
