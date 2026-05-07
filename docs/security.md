@@ -14,16 +14,17 @@ WaveForward in a workspace that contains data you do not want captured.
 
 WaveForward supports non-interactive local agent commands. Some supported tools
 require flags that allow automatic edits or skip normal confirmation prompts.
-For this reason, agent execution requires explicit opt-in:
+Treat any connected daemon as capable of invoking the configured agent in the
+workspace. The app-generated background daemon command includes an explicit
+local acknowledgement:
 
 ```bash
 waveforward daemon-start --allow-agent-execution ...
 ```
 
-The app-generated setup command includes this flag for the selected workspace.
-For manual foreground daemon runs, set `WAVEFORWARD_ALLOW_UNSAFE_AGENT_EXECUTION=1`
-or pass `waveforward daemon --allow-agent-execution ...`. Use a dedicated
-workspace and review the connected service before enabling this setting.
+Use a dedicated workspace and review the connected service before starting a
+daemon. Manual foreground daemon runs should only be used against a service you
+control and trust.
 
 ## Tokens
 

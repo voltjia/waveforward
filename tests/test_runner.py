@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 import subprocess
 import sys
 import tempfile
@@ -13,7 +12,6 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from waveforward.core import AgentSyncError  # noqa: E402
 from waveforward.runner import (  # noqa: E402
-    UNSAFE_AGENT_EXECUTION_ENV,
     agent_capabilities,
     run_claude_code,
     run_codex,
@@ -26,7 +24,6 @@ class RunnerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             with (
-                patch.dict(os.environ, {UNSAFE_AGENT_EXECUTION_ENV: "1"}),
                 patch(
                     "waveforward.runner.shutil.which",
                     return_value="/usr/bin/claude",
@@ -40,7 +37,11 @@ class RunnerTests(unittest.TestCase):
                     stderr="",
                 )
 
-                result = run_claude_code(root, prompt="continue this")
+                result = run_claude_code(
+                    root,
+                    prompt="continue this",
+                    model="opus",
+                )
 
             command = run.call_args.args[0]
             self.assertEqual(command[0], "claude")
@@ -49,14 +50,16 @@ class RunnerTests(unittest.TestCase):
             self.assertIn("acceptEdits", command)
             self.assertIn("--output-format", command)
             self.assertIn("text", command)
+            self.assertIn("--model", command)
+            self.assertIn("opus", command)
             self.assertEqual(result.agent, "claude-code")
+            self.assertEqual(result.model, "opus")
             self.assertEqual(result.output, "done")
 
     def test_run_codex_uses_exec_in_workspace(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             with (
-                patch.dict(os.environ, {UNSAFE_AGENT_EXECUTION_ENV: "1"}),
                 patch("waveforward.runner.shutil.which", return_value="/usr/bin/codex"),
                 patch("waveforward.runner.subprocess.run") as run,
             ):
@@ -67,22 +70,32 @@ class RunnerTests(unittest.TestCase):
                     stderr="",
                 )
 
-                result = run_codex(root, prompt="continue this")
+                result = run_codex(
+                    root,
+                    prompt="continue this",
+                    model="gpt-5.5",
+                    reasoning_effort="high",
+                )
 
             command = run.call_args.args[0]
             self.assertEqual(command[:2], ("codex", "exec"))
+            self.assertIn("--model", command)
+            self.assertIn("gpt-5.5", command)
+            self.assertIn("-c", command)
+            self.assertIn('model_reasoning_effort="high"', command)
             self.assertIn("--dangerously-bypass-approvals-and-sandbox", command)
             self.assertIn("--cd", command)
             self.assertIn(str(root), command)
             self.assertIn("--output-last-message", command)
             self.assertEqual(result.agent, "codex")
+            self.assertEqual(result.model, "gpt-5.5")
+            self.assertEqual(result.reasoning_effort, "high")
             self.assertEqual(result.output, "done")
 
     def test_run_opencode_uses_free_model(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             with (
-                patch.dict(os.environ, {UNSAFE_AGENT_EXECUTION_ENV: "1"}),
                 patch(
                     "waveforward.runner.shutil.which",
                     return_value="/usr/bin/opencode",
@@ -115,22 +128,20 @@ class RunnerTests(unittest.TestCase):
         self.assertTrue(available["codex"])
         self.assertFalse(available["claude-code"])
         self.assertFalse(available["opencode"])
+        codex = next(item for item in capabilities if item["id"] == "codex")
+        claude = next(item for item in capabilities if item["id"] == "claude-code")
+        self.assertTrue(codex["supports_reasoning_effort"])
+        self.assertFalse(claude["supports_reasoning_effort"])
+        self.assertIn(
+            {"value": "gpt-5.5", "label": "GPT-5.5"},
+            codex["model_options"],
+        )
 
     def test_missing_agent_command_returns_clear_error(self) -> None:
         with (
             tempfile.TemporaryDirectory() as directory,
-            patch.dict(os.environ, {UNSAFE_AGENT_EXECUTION_ENV: "1"}),
             patch("waveforward.runner.shutil.which", return_value=None),
             self.assertRaisesRegex(AgentSyncError, "Codex is not installed"),
-        ):
-            run_codex(Path(directory), prompt="continue this")
-
-    def test_agent_execution_requires_explicit_opt_in(self) -> None:
-        with (
-            tempfile.TemporaryDirectory() as directory,
-            patch.dict(os.environ, {}, clear=True),
-            patch("waveforward.runner.shutil.which", return_value="/usr/bin/codex"),
-            self.assertRaisesRegex(AgentSyncError, "opt in"),
         ):
             run_codex(Path(directory), prompt="continue this")
 
