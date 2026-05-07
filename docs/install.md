@@ -26,7 +26,9 @@ waveforward doctor
 waveforward daemon-status
 ```
 
-If `waveforward` is not found, add `~/.local/bin` to `PATH`.
+The installer updates common shell profile files by default. Restart the shell,
+or run the printed `export PATH=...` command for the current terminal if
+`waveforward` is not found.
 
 ## Shortcut Behavior
 
@@ -65,7 +67,7 @@ agent turns:
 
 ```bash
 waveforward daemon-start \
-  --server https://app.waveforward.tech \
+  --server https://waveforward.tech \
   --auth-token '<setup-token>' \
   --machine 'Laptop' \
   --allow-agent-execution
@@ -81,7 +83,7 @@ private.
 ```bash
 scripts/install-daemon-service.sh \
   --workspace /path/to/workspace \
-  --server https://app.waveforward.tech \
+  --server https://waveforward.tech \
   --token '<setup-token>' \
   --machine 'Desktop'
 ```
