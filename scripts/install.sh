@@ -3,6 +3,7 @@ set -eu
 
 PREFIX="${PREFIX:-$HOME/.local}"
 PYTHON="${PYTHON:-python3}"
+WAVEFORWARD_INSTALL_UPDATE_PATH="${WAVEFORWARD_INSTALL_UPDATE_PATH:-1}"
 SOURCE=""
 REPO=""
 REF=""
@@ -35,6 +36,7 @@ Examples:
   scripts/install.sh --repo https://github.com/voltjia/waveforward.git --ref main
 
 Environment:
+  WAVEFORWARD_INSTALL_UPDATE_PATH=0   Do not update shell PATH profiles.
   WAVEFORWARD_INSTALL_WF_ALIAS=0      Do not create the wf shortcut.
   WAVEFORWARD_INSTALL_WF_ALIAS=force  Replace an existing wf command.
 USAGE
@@ -167,6 +169,132 @@ verify_archive_checksum() {
     exit 1
   fi
   echo "Verified checksum: $target"
+}
+
+path_profile_has_marker() {
+  profile="$1"
+  marker="$2"
+  [ -f "$profile" ] || return 1
+  awk -v marker="$marker" '$0 == marker { found = 1 } END { exit(found ? 0 : 1) }' "$profile"
+}
+
+append_posix_path_profile() {
+  profile="$1"
+  marker="# WaveForward PATH: $BIN_DIR"
+  if path_profile_has_marker "$profile" "$marker"; then
+    return 1
+  fi
+
+  profile_dir="${profile%/*}"
+  [ "$profile_dir" = "$profile" ] || mkdir -p "$profile_dir"
+  {
+    printf '\n%s\n' "$marker"
+    printf '_waveforward_bin_dir=%s\n' "$path_quoted"
+    printf 'case ":$PATH:" in\n'
+    printf '  *":$_waveforward_bin_dir:"*) ;;\n'
+    printf '  *) export PATH="$_waveforward_bin_dir:$PATH" ;;\n'
+    printf 'esac\n'
+    printf 'unset _waveforward_bin_dir\n'
+  } >>"$profile" || {
+    echo "error: could not update PATH in $profile" >&2
+    exit 1
+  }
+  return 0
+}
+
+append_fish_path_profile() {
+  profile="$1"
+  marker="# WaveForward PATH: $BIN_DIR"
+  if path_profile_has_marker "$profile" "$marker"; then
+    return 1
+  fi
+
+  profile_dir="${profile%/*}"
+  [ "$profile_dir" = "$profile" ] || mkdir -p "$profile_dir"
+  {
+    printf '\n%s\n' "$marker"
+    printf 'if not contains -- %s $PATH\n' "$path_quoted"
+    printf '    set -gx PATH %s $PATH\n' "$path_quoted"
+    printf 'end\n'
+  } >>"$profile" || {
+    echo "error: could not update PATH in $profile" >&2
+    exit 1
+  }
+  return 0
+}
+
+record_path_update() {
+  if [ -z "$updated_profiles" ]; then
+    updated_profiles="$1"
+  else
+    updated_profiles="$updated_profiles, $1"
+  fi
+}
+
+try_append_posix_path_profile() {
+  if append_posix_path_profile "$1"; then
+    record_path_update "$1"
+  fi
+}
+
+try_append_fish_path_profile() {
+  if append_fish_path_profile "$1"; then
+    record_path_update "$1"
+  fi
+}
+
+configure_shell_path() {
+  case "$WAVEFORWARD_INSTALL_UPDATE_PATH" in
+    0|false|no)
+      echo "Skipped shell PATH update because WAVEFORWARD_INSTALL_UPDATE_PATH=$WAVEFORWARD_INSTALL_UPDATE_PATH."
+      echo "Add this to PATH if needed: $BIN_DIR"
+      return
+      ;;
+  esac
+
+  case ":$PATH:" in
+    *":$BIN_DIR:"*)
+      echo "$BIN_DIR is already on PATH."
+      return
+      ;;
+  esac
+
+  path_quoted="$("$PYTHON" - "$BIN_DIR" <<'PY'
+import shlex
+import sys
+
+print(shlex.quote(sys.argv[1]))
+PY
+)"
+  updated_profiles=""
+  shell_name="${SHELL:-}"
+  shell_name="${shell_name##*/}"
+
+  case "$shell_name" in
+    bash)
+      try_append_posix_path_profile "$HOME/.bashrc"
+      try_append_posix_path_profile "$HOME/.profile"
+      ;;
+    zsh)
+      try_append_posix_path_profile "$HOME/.zshrc"
+      try_append_posix_path_profile "$HOME/.profile"
+      ;;
+    fish)
+      try_append_fish_path_profile "$HOME/.config/fish/config.fish"
+      try_append_posix_path_profile "$HOME/.profile"
+      ;;
+    *)
+      try_append_posix_path_profile "$HOME/.profile"
+      ;;
+  esac
+
+  if [ -n "$updated_profiles" ]; then
+    echo "Updated shell PATH in: $updated_profiles"
+    echo "Restart your shell to use waveforward from PATH in new terminals."
+    echo "For this terminal, run: export PATH=$path_quoted:\$PATH"
+  else
+    echo "Add this to PATH if needed: $BIN_DIR"
+  fi
 }
 
 resolve_manifest_archive() {
@@ -326,9 +454,4 @@ EOF
 esac
 
 echo "WaveForward installed: $WRAPPER"
-case ":$PATH:" in
-  *":$BIN_DIR:"*) ;;
-  *)
-    echo "Add this to PATH if needed: $BIN_DIR"
-    ;;
-esac
+configure_shell_path
