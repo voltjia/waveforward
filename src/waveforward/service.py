@@ -31,11 +31,13 @@ from waveforward.core import (
     utc_now,
 )
 from waveforward.runner import AgentRunResult, agent_capabilities, run_agent
+from waveforward.store import workspace_write_lock, write_json
 
 CONVERSATION_VERSION = 1
 DEFAULT_AGENT = "codex"
 DEFAULT_MACHINE = "local"
 OutputCallback = Callable[[str], None]
+CancelCheck = Callable[[], bool]
 
 
 @dataclass(frozen=True)
@@ -93,6 +95,7 @@ class AgentRunner(Protocol):
         model: str | None = None,
         reasoning_effort: str | None = None,
         on_output: OutputCallback | None = None,
+        cancel_check: CancelCheck | None = None,
     ) -> AgentRunResult:
         """Run an agent command."""
 
@@ -513,6 +516,7 @@ def run_conversation_turn(
     execute_agent: bool = True,
     agent_runner: AgentRunner = run_agent,
     on_output: OutputCallback | None = None,
+    cancel_check: CancelCheck | None = None,
     owner: str | None = None,
 ) -> ConversationTurnResult:
     """Run one user-visible WaveForward conversation turn."""
@@ -539,6 +543,7 @@ def run_conversation_turn(
         execute_agent=execute_agent,
         agent_runner=agent_runner,
         on_output=on_output,
+        cancel_check=cancel_check,
         conversation=conversation,
         owner=owner,
     )
@@ -555,6 +560,7 @@ def complete_conversation_turn(
     execute_agent: bool = True,
     agent_runner: AgentRunner = run_agent,
     on_output: OutputCallback | None = None,
+    cancel_check: CancelCheck | None = None,
     conversation: dict[str, Any] | None = None,
     owner: str | None = None,
 ) -> ConversationTurnResult:
@@ -585,6 +591,7 @@ def complete_conversation_turn(
     )
     agent_run = None
     if execute_agent:
+        _raise_if_canceled(cancel_check)
         prompt = _render_agent_prompt(
             conversation,
             agent=destination_agent,
@@ -592,15 +599,19 @@ def complete_conversation_turn(
             model=destination_model,
             reasoning_effort=destination_reasoning,
         )
-        agent_run = _run_agent_runner(
-            agent_runner,
-            root,
-            agent=destination_agent,
-            model=destination_model,
-            reasoning_effort=destination_reasoning,
-            prompt=prompt,
-            on_output=on_output,
-        )
+        with workspace_write_lock(root):
+            _raise_if_canceled(cancel_check)
+            agent_run = _run_agent_runner(
+                agent_runner,
+                root,
+                agent=destination_agent,
+                model=destination_model,
+                reasoning_effort=destination_reasoning,
+                prompt=prompt,
+                on_output=on_output,
+                cancel_check=cancel_check,
+            )
+        _raise_if_canceled(cancel_check)
         conversation = add_message(
             root,
             conversation_id,
@@ -1081,6 +1092,7 @@ def _run_agent_runner(
     reasoning_effort: str | None,
     prompt: str,
     on_output: OutputCallback | None,
+    cancel_check: CancelCheck | None = None,
 ) -> AgentRunResult:
     kwargs: dict[str, Any] = {"agent": agent, "prompt": prompt}
     if model and _runner_accepts_parameter(agent_runner, "model"):
@@ -1092,7 +1104,17 @@ def _run_agent_runner(
         kwargs["reasoning_effort"] = reasoning_effort
     if on_output is not None and _runner_accepts_parameter(agent_runner, "on_output"):
         kwargs["on_output"] = on_output
+    if cancel_check is not None and _runner_accepts_parameter(
+        agent_runner,
+        "cancel_check",
+    ):
+        kwargs["cancel_check"] = cancel_check
     return agent_runner(root, **kwargs)
+
+
+def _raise_if_canceled(cancel_check: CancelCheck | None) -> None:
+    if cancel_check is not None and cancel_check():
+        raise AgentSyncError("Run canceled.")
 
 
 def _runner_accepts_output(agent_runner: AgentRunner) -> bool:
@@ -1275,11 +1297,7 @@ def _ensure_owner(
 
 def _write_conversation(root: Path, conversation: dict[str, Any]) -> None:
     path = _conversation_path(root, conversation["id"])
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(conversation, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
+    write_json(path, conversation)
 
 
 def _write_snapshot_conversation(

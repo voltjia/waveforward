@@ -6,6 +6,7 @@ import json
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -16,15 +17,20 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from waveforward.daemon import (  # noqa: E402
     PUBLIC_RELEASE_MANIFEST_URL,
+    READONLY_WORKSPACE_JOB_KINDS,
     UNSAFE_AGENT_EXECUTION_ENV,
     CloudClient,
     DaemonConfig,
+    _accepted_job_kinds,
+    _ActiveDaemonJob,
     _daemon_runtime_payload,
     _daemon_update_manifest_url,
     _daemon_update_payload,
     _load_or_create_daemon_state,
+    _poll_once,
     _post_job_completion,
     _process_job,
+    _refresh_active_jobs,
     _save_daemon_state,
     daemon_status,
     start_daemon_process,
@@ -96,6 +102,31 @@ class _RecordingClient:
 
     def post(self, path: str, payload: dict[str, object]) -> dict[str, object]:
         self.posts.append((path, payload))
+        return {"ok": True}
+
+
+class _PollingClient:
+    auth_header = "Bearer machine-token"
+    server = "https://app.example.test/"
+
+    def __init__(self, jobs: list[dict[str, object]]) -> None:
+        self.jobs = list(jobs)
+        self.next_payloads: list[dict[str, object]] = []
+
+    def post(self, path: str, payload: dict[str, object]) -> dict[str, object]:
+        if path == "/api/daemon/register":
+            return {
+                "machine": {
+                    "id": payload["machine_id"],
+                    "name": "Remote machine",
+                }
+            }
+        if path == "/api/daemon/jobs/next":
+            self.next_payloads.append(dict(payload))
+            job = self.jobs.pop(0) if self.jobs else None
+            return {"job": job}
+        if path.endswith("/status"):
+            return {"run": {"status": "running"}}
         return {"ok": True}
 
 
@@ -176,6 +207,7 @@ class DaemonClientTests(unittest.TestCase):
                 server="https://app.example.test",
                 auth_token="setup-secret",
                 machine_name="Laptop",
+                update_manifest_url="https://example.test/manifest.json",
             )
             with patch(
                 "waveforward.daemon.Popen",
@@ -199,6 +231,10 @@ class DaemonClientTests(unittest.TestCase):
             self.assertIn("setup-secret", command)
             self.assertEqual(kwargs["cwd"], root.resolve())
             self.assertEqual(kwargs["env"][UNSAFE_AGENT_EXECUTION_ENV], "1")
+            self.assertEqual(
+                kwargs["env"]["WAVEFORWARD_DAEMON_UPDATE_MANIFEST_URL"],
+                "https://example.test/manifest.json",
+            )
             pid_path = root / ".waveforward" / "daemon.pid"
             self.assertEqual(pid_path.read_text(encoding="utf-8"), "4242\n")
             self.assertNotIn("setup-secret", pid_path.read_text(encoding="utf-8"))
@@ -395,6 +431,154 @@ class DaemonClientTests(unittest.TestCase):
             _path, payload = client.posts[-1]
             self.assertEqual(payload["agent_run"]["agent"], "session-import")
             self.assertEqual(payload["agent_run"]["candidates"][0]["id"], "codex-1")
+
+    def test_poll_once_keeps_control_loop_available_during_job(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / ".waveforward").mkdir()
+            state = {"machine_id": "machine-alpha"}
+            active_jobs: dict[str, _ActiveDaemonJob] = {}
+            started = threading.Event()
+            release = threading.Event()
+            job = {
+                "agent": "codex",
+                "id": "run-agent",
+                "job": {"kind": "conversation_turn"},
+            }
+            client = _PollingClient([job])
+
+            def process_job(**_kwargs: object) -> None:
+                started.set()
+                release.wait(timeout=5)
+
+            with (
+                patch("waveforward.daemon._daemon_runtime_payload", return_value={}),
+                patch("waveforward.daemon._process_job", side_effect=process_job),
+            ):
+                claimed = _poll_once(
+                    client,
+                    root,
+                    state,
+                    config=DaemonConfig(server="https://app.example.test"),
+                    active_jobs=active_jobs,
+                )
+                self.assertTrue(started.wait(timeout=2))
+                self.assertTrue(claimed)
+                self.assertIn("run-agent", active_jobs)
+
+                _poll_once(
+                    client,
+                    root,
+                    state,
+                    config=DaemonConfig(server="https://app.example.test"),
+                    active_jobs=active_jobs,
+                )
+
+            self.assertEqual(
+                client.next_payloads[-1]["accepted_kinds"],
+                sorted(READONLY_WORKSPACE_JOB_KINDS),
+            )
+            release.set()
+            active_jobs["run-agent"].thread.join(timeout=2)
+
+    def test_refresh_active_jobs_observes_remote_cancel(self) -> None:
+        stop = threading.Event()
+        cancel_event = threading.Event()
+
+        def wait_forever() -> None:
+            stop.wait(timeout=5)
+
+        thread = threading.Thread(target=wait_forever)
+        thread.start()
+        try:
+            active_jobs = {
+                "run-cancel": _ActiveDaemonJob(
+                    id="run-cancel",
+                    kind="conversation_turn",
+                    thread=thread,
+                    cancel_event=cancel_event,
+                    started_at=0.0,
+                )
+            }
+
+            class CancelClient:
+                def post(
+                    self,
+                    _path: str,
+                    _payload: dict[str, object],
+                ) -> dict[str, object]:
+                    return {"run": {"status": "canceled"}}
+
+            _refresh_active_jobs(
+                CancelClient(),
+                active_jobs,
+                machine_id="machine-alpha",
+            )
+
+            self.assertTrue(cancel_event.is_set())
+        finally:
+            stop.set()
+            thread.join(timeout=2)
+
+    def test_accepted_job_kinds_block_exclusive_jobs(self) -> None:
+        thread = threading.Thread(target=lambda: None)
+        active_jobs = {
+            "write": _ActiveDaemonJob(
+                id="write",
+                kind="workspace_file_write",
+                thread=thread,
+                cancel_event=threading.Event(),
+                started_at=0.0,
+            )
+        }
+
+        self.assertEqual(_accepted_job_kinds(active_jobs), set())
+        active_jobs["write"] = _ActiveDaemonJob(
+            id="update",
+            kind="daemon_update",
+            thread=thread,
+            cancel_event=threading.Event(),
+            started_at=0.0,
+        )
+        self.assertEqual(_accepted_job_kinds(active_jobs), set())
+
+    def test_daemon_update_job_installs_verified_wheel_and_restarts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            wheel = root / "waveforward-0.2.0-py3-none-any.whl"
+            wheel.write_bytes(b"wheel")
+            client = _RecordingClient()
+            machine = {"id": "machine-test", "name": "Remote machine"}
+            job = {
+                "agent": "codex",
+                "id": "run-update",
+                "job": {
+                    "kind": "daemon_update",
+                    "manifest_url": "https://example.test/manifest.json",
+                },
+            }
+
+            with (
+                patch("waveforward.daemon.download_update_wheel", return_value=wheel),
+                patch("waveforward.daemon._restart_daemon_process") as restart,
+                patch("waveforward.daemon.subprocess.run") as run,
+            ):
+                run.return_value = subprocess.CompletedProcess(
+                    args=[],
+                    returncode=0,
+                    stdout="installed\n",
+                    stderr="",
+                )
+
+                _process_job(client, root, machine=machine, job=job)
+
+            command = run.call_args.args[0]
+            self.assertEqual(command[:4], [sys.executable, "-m", "pip", "install"])
+            self.assertIn(str(wheel), command)
+            restart.assert_called_once_with()
+            _path, payload = client.posts[-1]
+            self.assertEqual(payload["agent_run"]["agent"], "daemon-update")
+            self.assertIn("installed", payload["agent_run"]["output"])
 
     def test_job_completion_retries_transient_cloud_errors(self) -> None:
         client = _CompletionClient(failures=2)

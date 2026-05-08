@@ -155,6 +155,10 @@ def build_parser() -> argparse.ArgumentParser:
     daemon_parser.add_argument("--auth-token", help="Bearer token.")
     daemon_parser.add_argument("--machine", help="Human-readable machine name.")
     daemon_parser.add_argument(
+        "--update-manifest-url",
+        help="Release manifest URL or path used for daemon self-updates.",
+    )
+    daemon_parser.add_argument(
         "--poll-interval",
         default=2.0,
         type=float,
@@ -181,6 +185,10 @@ def build_parser() -> argparse.ArgumentParser:
     daemon_start_parser.add_argument("--auth-password", help="Basic Auth password.")
     daemon_start_parser.add_argument("--auth-token", help="Bearer token.")
     daemon_start_parser.add_argument("--machine", help="Human-readable machine name.")
+    daemon_start_parser.add_argument(
+        "--update-manifest-url",
+        help="Release manifest URL or path used for daemon self-updates.",
+    )
     daemon_start_parser.add_argument(
         "--poll-interval",
         default=2.0,
@@ -397,6 +405,8 @@ def _daemon_config_from_args(args: argparse.Namespace) -> DaemonConfig:
         auth_token=args.auth_token or os.getenv("WAVEFORWARD_DAEMON_TOKEN"),
         machine_name=args.machine or os.getenv("WAVEFORWARD_DAEMON_MACHINE"),
         poll_interval=args.poll_interval,
+        update_manifest_url=args.update_manifest_url
+        or os.getenv("WAVEFORWARD_DAEMON_UPDATE_MANIFEST_URL"),
     )
 
 

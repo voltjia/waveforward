@@ -12,6 +12,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from waveforward.core import AgentSyncError  # noqa: E402
 from waveforward.runner import (  # noqa: E402
+    _run_command,
     agent_capabilities,
     run_claude_code,
     run_codex,
@@ -144,6 +145,25 @@ class RunnerTests(unittest.TestCase):
             self.assertRaisesRegex(AgentSyncError, "Codex is not installed"),
         ):
             run_codex(Path(directory), prompt="continue this")
+
+    def test_streaming_command_can_be_canceled(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            chunks: list[str] = []
+
+            with self.assertRaisesRegex(AgentSyncError, "Run canceled"):
+                _run_command(
+                    root,
+                    (
+                        sys.executable,
+                        "-c",
+                        "import time; print('started', flush=True); time.sleep(30)",
+                    ),
+                    on_output=chunks.append,
+                    cancel_check=lambda: bool(chunks),
+                )
+
+            self.assertIn("started", "".join(chunks))
 
 
 if __name__ == "__main__":
