@@ -3,11 +3,17 @@
 from __future__ import annotations
 
 import json
+import os
+import queue
 import re
 import shutil
+import signal
 import subprocess
 import tempfile
+import threading
+import time
 from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -18,6 +24,8 @@ DEFAULT_OPENCODE_MODEL = "opencode/minimax-m2.5-free"
 MAX_AGENT_OUTPUT_CHARS = 6000
 ANSI_PATTERN = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 OutputCallback = Callable[[str], None]
+CancelCheck = Callable[[], bool]
+COMMAND_CANCEL_GRACE_SECONDS = 5.0
 REASONING_EFFORTS = ("low", "medium", "high", "xhigh")
 AGENT_COMMANDS = {
     "claude-code": ("Claude Code", "claude"),
@@ -66,6 +74,7 @@ def run_agent(
     model: str | None = None,
     reasoning_effort: str | None = None,
     on_output: OutputCallback | None = None,
+    cancel_check: CancelCheck | None = None,
 ) -> AgentRunResult:
     """Run a supported local agent for a WaveForward conversation turn."""
 
@@ -77,6 +86,7 @@ def run_agent(
             model=model,
             reasoning_effort=reasoning_effort,
             on_output=on_output,
+            cancel_check=cancel_check,
         )
     if normalized == "codex":
         return run_codex(
@@ -85,6 +95,7 @@ def run_agent(
             model=model,
             reasoning_effort=reasoning_effort,
             on_output=on_output,
+            cancel_check=cancel_check,
         )
     if normalized == "opencode":
         return run_opencode(
@@ -93,6 +104,7 @@ def run_agent(
             model=model or DEFAULT_OPENCODE_MODEL,
             reasoning_effort=reasoning_effort,
             on_output=on_output,
+            cancel_check=cancel_check,
         )
     raise AgentSyncError(f"Agent runner is not available yet: {agent}")
 
@@ -122,6 +134,7 @@ def run_claude_code(
     model: str | None = None,
     reasoning_effort: str | None = None,
     on_output: OutputCallback | None = None,
+    cancel_check: CancelCheck | None = None,
 ) -> AgentRunResult:
     """Run Claude Code non-interactively in a workspace."""
 
@@ -137,7 +150,12 @@ def run_claude_code(
         *model_args,
         prompt,
     )
-    returncode, output = _run_command(root, command, on_output=on_output)
+    returncode, output = _run_command(
+        root,
+        command,
+        on_output=on_output,
+        cancel_check=cancel_check,
+    )
     if returncode != 0:
         raise AgentSyncError(
             f"Claude Code failed with exit code {returncode}.\n{output}"
@@ -159,6 +177,7 @@ def run_codex(
     model: str | None = None,
     reasoning_effort: str | None = None,
     on_output: OutputCallback | None = None,
+    cancel_check: CancelCheck | None = None,
 ) -> AgentRunResult:
     """Run Codex CLI non-interactively in a workspace."""
 
@@ -184,7 +203,12 @@ def run_codex(
             str(last_message_path),
             prompt,
         )
-        returncode, output = _run_command(root, command, on_output=on_output)
+        returncode, output = _run_command(
+            root,
+            command,
+            on_output=on_output,
+            cancel_check=cancel_check,
+        )
         if returncode == 0 and last_message_path.exists():
             output = _clean_output(last_message_path.read_text(encoding="utf-8"), "")
     if returncode != 0:
@@ -206,6 +230,7 @@ def run_opencode(
     model: str = DEFAULT_OPENCODE_MODEL,
     reasoning_effort: str | None = None,
     on_output: OutputCallback | None = None,
+    cancel_check: CancelCheck | None = None,
 ) -> AgentRunResult:
     """Run OpenCode non-interactively in a workspace."""
 
@@ -218,7 +243,12 @@ def run_opencode(
         "--dangerously-skip-permissions",
         prompt,
     )
-    returncode, output = _run_command(root, command, on_output=on_output)
+    returncode, output = _run_command(
+        root,
+        command,
+        on_output=on_output,
+        cancel_check=cancel_check,
+    )
     if returncode != 0:
         raise AgentSyncError(f"OpenCode failed with exit code {returncode}.\n{output}")
     return AgentRunResult(
@@ -241,8 +271,9 @@ def _run_command(
     command: tuple[str, ...],
     *,
     on_output: OutputCallback | None,
+    cancel_check: CancelCheck | None = None,
 ) -> tuple[int, str]:
-    if on_output is None:
+    if on_output is None and cancel_check is None:
         result = subprocess.run(
             command,
             cwd=root,
@@ -259,15 +290,129 @@ def _run_command(
         stdout=subprocess.PIPE,
         text=True,
         bufsize=1,
+        start_new_session=True,
     )
+    output_queue: queue.Queue[str | None] = queue.Queue()
+
+    def read_stdout() -> None:
+        try:
+            if process.stdout is not None:
+                for chunk in process.stdout:
+                    output_queue.put(chunk)
+        finally:
+            output_queue.put(None)
+
+    reader = threading.Thread(
+        target=read_stdout,
+        name="waveforward-agent-output",
+        daemon=True,
+    )
+    reader.start()
+
     chunks: list[str] = []
+    stdout_done = False
+    canceled = False
+    while process.poll() is None:
+        stdout_done = _drain_output_queue(
+            output_queue,
+            chunks,
+            on_output=on_output,
+            stdout_done=stdout_done,
+        )
+        if cancel_check is not None and cancel_check():
+            canceled = True
+            _terminate_process_tree(process)
+            break
+        time.sleep(0.05)
+
+    if canceled and process.poll() is None:
+        deadline = time.monotonic() + COMMAND_CANCEL_GRACE_SECONDS
+        while process.poll() is None and time.monotonic() < deadline:
+            stdout_done = _drain_output_queue(
+                output_queue,
+                chunks,
+                on_output=on_output,
+                stdout_done=stdout_done,
+            )
+            time.sleep(0.05)
+        if process.poll() is None:
+            _kill_process_tree(process)
+
+    returncode = process.wait()
+    reader.join(timeout=1.0)
     if process.stdout is not None:
-        for chunk in process.stdout:
-            chunks.append(chunk)
-            cleaned = ANSI_PATTERN.sub("", chunk)
-            if cleaned:
-                on_output(cleaned)
-    return process.wait(), _clean_output("".join(chunks), "")
+        with suppress(OSError):
+            process.stdout.close()
+    while not stdout_done:
+        stdout_done = _drain_output_queue(
+            output_queue,
+            chunks,
+            on_output=on_output,
+            stdout_done=stdout_done,
+        )
+    if canceled:
+        raise AgentSyncError("Run canceled.")
+    return returncode, _clean_output("".join(chunks), "")
+
+
+def _drain_output_queue(
+    output_queue: queue.Queue[str | None],
+    chunks: list[str],
+    *,
+    on_output: OutputCallback | None,
+    stdout_done: bool,
+) -> bool:
+    done = stdout_done
+    while True:
+        try:
+            chunk = output_queue.get_nowait()
+        except queue.Empty:
+            return done
+        if chunk is None:
+            done = True
+            continue
+        chunks.append(chunk)
+        cleaned = ANSI_PATTERN.sub("", chunk)
+        if cleaned and on_output is not None:
+            on_output(cleaned)
+
+
+def _terminate_process_tree(process: subprocess.Popen[str]) -> None:
+    if _terminate_with_psutil(process, kill=False):
+        return
+    if os.name == "posix":
+        with suppress(ProcessLookupError, PermissionError, OSError):
+            os.killpg(process.pid, signal.SIGTERM)
+            return
+    with suppress(ProcessLookupError, PermissionError, OSError):
+        process.terminate()
+
+
+def _kill_process_tree(process: subprocess.Popen[str]) -> None:
+    if _terminate_with_psutil(process, kill=True):
+        return
+    if os.name == "posix":
+        with suppress(ProcessLookupError, PermissionError, OSError):
+            os.killpg(process.pid, signal.SIGKILL)
+            return
+    with suppress(ProcessLookupError, PermissionError, OSError):
+        process.kill()
+
+
+def _terminate_with_psutil(process: subprocess.Popen[str], *, kill: bool) -> bool:
+    try:
+        import psutil  # type: ignore[import-not-found]
+    except ImportError:
+        return False
+    try:
+        parent = psutil.Process(process.pid)
+        children = parent.children(recursive=True)
+        for child in children:
+            child.kill() if kill else child.terminate()
+        parent.kill() if kill else parent.terminate()
+    except psutil.Error:
+        return False
+    return True
 
 
 def _clean_output(stdout: str, stderr: str) -> str:

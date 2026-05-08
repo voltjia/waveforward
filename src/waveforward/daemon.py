@@ -6,10 +6,12 @@ import base64
 import json
 import os
 import platform
+import subprocess
 import sys
+import tempfile
+import threading
 import time
 import uuid
-from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from subprocess import DEVNULL, STDOUT, Popen
@@ -42,13 +44,37 @@ from waveforward.service import (
     save_conversation,
     service_status,
 )
-from waveforward.update import check_for_update
+from waveforward.store import atomic_write_text, write_json
+from waveforward.update import check_for_update, download_update_wheel
 
 UNSAFE_AGENT_EXECUTION_ENV = "WAVEFORWARD_ALLOW_UNSAFE_AGENT_EXECUTION"
 PUBLIC_RELEASE_MANIFEST_URL = (
     "https://github.com/voltjia/waveforward/releases/latest/download/"
     "waveforward-release-manifest.json"
 )
+WORKSPACE_JOB_KINDS = {
+    "workspace_tree",
+    "workspace_file_read",
+    "workspace_file_write",
+    "workspace_file_diff",
+}
+READONLY_WORKSPACE_JOB_KINDS = {
+    "workspace_tree",
+    "workspace_file_read",
+    "workspace_file_diff",
+}
+EXCLUSIVE_JOB_KINDS = {"daemon_update", "workspace_file_write"}
+
+
+@dataclass
+class _ActiveDaemonJob:
+    """One daemon job running outside the control polling loop."""
+
+    id: str
+    kind: str
+    thread: threading.Thread
+    cancel_event: threading.Event
+    started_at: float
 
 
 @dataclass(frozen=True)
@@ -162,9 +188,16 @@ def run_daemon(
     if daemon_state.get("machine_token"):
         client.set_bearer_token(str(daemon_state["machine_token"]))
     retry_delay = max(config.poll_interval, 0.5)
+    active_jobs: dict[str, _ActiveDaemonJob] = {}
     while True:
         try:
-            _poll_once(client, root, daemon_state, config=config)
+            claimed = _poll_once(
+                client,
+                root,
+                daemon_state,
+                config=config,
+                active_jobs=active_jobs,
+            )
             retry_delay = max(config.poll_interval, 0.5)
         except AgentSyncError as error:
             if once:
@@ -174,6 +207,15 @@ def run_daemon(
             retry_delay = min(retry_delay * 2, 30.0)
             continue
         if once:
+            while active_jobs:
+                _refresh_active_jobs(
+                    client,
+                    active_jobs,
+                    machine_id=str(daemon_state["machine_id"]),
+                )
+                time.sleep(0.05)
+            if not claimed:
+                return
             return
         time.sleep(max(config.poll_interval, 0.2))
 
@@ -267,15 +309,96 @@ def _poll_once(
     daemon_state: dict[str, Any],
     *,
     config: DaemonConfig,
-) -> None:
+    active_jobs: dict[str, _ActiveDaemonJob],
+) -> bool:
     machine_id = str(daemon_state["machine_id"])
     machine = _register(client, root, daemon_state, config=config)
+    _refresh_active_jobs(client, active_jobs, machine_id=machine_id)
+    accepted_kinds = _accepted_job_kinds(active_jobs)
+    payload: dict[str, Any] = {"machine_id": machine_id}
+    if accepted_kinds is not None:
+        payload["accepted_kinds"] = sorted(accepted_kinds)
     job = client.post(
         "/api/daemon/jobs/next",
-        {"machine_id": machine_id},
+        payload,
     ).get("job")
     if job:
-        _process_job(client, root, machine=machine, job=job)
+        _start_daemon_job(
+            client,
+            root,
+            machine=machine,
+            job=job,
+            active_jobs=active_jobs,
+        )
+        return True
+    return False
+
+
+def _accepted_job_kinds(active_jobs: dict[str, _ActiveDaemonJob]) -> set[str] | None:
+    if not active_jobs:
+        return None
+    if any(job.kind in EXCLUSIVE_JOB_KINDS for job in active_jobs.values()):
+        return set()
+    if any(job.kind not in WORKSPACE_JOB_KINDS for job in active_jobs.values()):
+        return READONLY_WORKSPACE_JOB_KINDS
+    return READONLY_WORKSPACE_JOB_KINDS
+
+
+def _start_daemon_job(
+    client: CloudClient,
+    root: Path,
+    *,
+    machine: dict[str, Any],
+    job: dict[str, Any],
+    active_jobs: dict[str, _ActiveDaemonJob],
+) -> None:
+    job_id = str(job["id"])
+    job_kind = str((job.get("job") or {}).get("kind") or "conversation_turn")
+    cancel_event = threading.Event()
+    thread = threading.Thread(
+        target=_process_job,
+        name=f"waveforward-daemon-{job_id}",
+        kwargs={
+            "client": client,
+            "root": root,
+            "machine": machine,
+            "job": job,
+            "cancel_event": cancel_event,
+        },
+        daemon=True,
+    )
+    active_jobs[job_id] = _ActiveDaemonJob(
+        id=job_id,
+        kind=job_kind,
+        thread=thread,
+        cancel_event=cancel_event,
+        started_at=time.time(),
+    )
+    thread.start()
+
+
+def _refresh_active_jobs(
+    client: CloudClient,
+    active_jobs: dict[str, _ActiveDaemonJob],
+    *,
+    machine_id: str,
+) -> None:
+    finished = [
+        job_id for job_id, active in active_jobs.items() if not active.thread.is_alive()
+    ]
+    for job_id in finished:
+        active_jobs.pop(job_id, None)
+    for job_id, active in list(active_jobs.items()):
+        try:
+            result = client.post(
+                f"/api/daemon/jobs/{job_id}/status",
+                {"machine_id": machine_id},
+            )
+        except AgentSyncError:
+            continue
+        run = result.get("run") if isinstance(result, dict) else None
+        if isinstance(run, dict) and run.get("status") == "canceled":
+            active.cancel_event.set()
 
 
 def _register(
@@ -316,6 +439,7 @@ def _process_job(
     *,
     machine: dict[str, Any],
     job: dict[str, Any],
+    cancel_event: threading.Event | None = None,
 ) -> None:
     job_id = job["id"]
     agent = str(job["agent"])
@@ -328,6 +452,21 @@ def _process_job(
         job_payload.get("reasoning_effort") or ""
     )
     job_kind = str(job_payload.get("kind") or "conversation_turn")
+    cancel_check = cancel_event.is_set if cancel_event is not None else None
+    if cancel_check is not None and cancel_check():
+        _post_canceled_completion(client, machine, job_id)
+        return
+    if job_kind == "daemon_update":
+        _process_daemon_update_job(
+            client,
+            root,
+            machine=machine,
+            job=job,
+            payload=job_payload,
+            config_manifest=str(job_payload.get("manifest_url") or ""),
+            cancel_event=cancel_event,
+        )
+        return
     if job_kind == "session_import_scan":
         _process_session_import_scan(
             client,
@@ -354,6 +493,7 @@ def _process_job(
             machine=machine,
             job=job,
             payload=job_payload,
+            cancel_event=cancel_event,
         )
         return
 
@@ -379,6 +519,7 @@ def _process_job(
             reasoning_effort=reasoning_effort,
             execute_agent=bool(job.get("execute_agent", True)),
             on_output=post_output,
+            cancel_check=cancel_check,
         )
     except Exception as error:
         _post_job_completion(
@@ -399,6 +540,18 @@ def _process_job(
             "conversation": turn.conversation,
             "agent_run": _agent_run_payload(turn.agent_run),
         },
+    )
+
+
+def _post_canceled_completion(
+    client: CloudClient,
+    machine: dict[str, Any],
+    job_id: str,
+) -> None:
+    _post_job_completion(
+        client,
+        f"/api/daemon/jobs/{job_id}/complete",
+        {"machine_id": machine["id"], "error": "Run canceled."},
     )
 
 
@@ -499,11 +652,14 @@ def _process_workspace_file_job(
     machine: dict[str, Any],
     job: dict[str, Any],
     payload: dict[str, Any],
+    cancel_event: threading.Event | None = None,
 ) -> None:
     job_id = job["id"]
     job_kind = str(payload.get("kind") or "")
     path = str(payload.get("path") or "")
     try:
+        if cancel_event is not None and cancel_event.is_set():
+            raise AgentSyncError("Run canceled.")
         if job_kind == "workspace_tree":
             result_key = "tree"
             result = list_workspace_tree(root, path=path)
@@ -549,6 +705,70 @@ def _process_workspace_file_job(
             },
         },
     )
+
+
+def _process_daemon_update_job(
+    client: CloudClient,
+    root: Path,
+    *,
+    machine: dict[str, Any],
+    job: dict[str, Any],
+    payload: dict[str, Any],
+    config_manifest: str,
+    cancel_event: threading.Event | None = None,
+) -> None:
+    job_id = job["id"]
+    manifest = config_manifest or str(payload.get("manifest") or "")
+    if not manifest:
+        manifest = PUBLIC_RELEASE_MANIFEST_URL
+    try:
+        if cancel_event is not None and cancel_event.is_set():
+            raise AgentSyncError("Run canceled.")
+        with tempfile.TemporaryDirectory(prefix="waveforward-update-") as tmp:
+            wheel = download_update_wheel(manifest, tmp)
+            client.post(
+                f"/api/daemon/jobs/{job_id}/output",
+                {"machine_id": machine["id"], "output": f"Installing {wheel.name}\n"},
+            )
+            result = subprocess.run(
+                [sys.executable, "-m", "pip", "install", "--upgrade", str(wheel)],
+                cwd=root,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+        output = "\n".join(
+            item for item in (result.stdout, result.stderr) if item.strip()
+        ).strip()
+        if result.returncode != 0:
+            raise AgentSyncError(
+                f"Daemon update failed with exit code {result.returncode}.\n{output}"
+            )
+        _post_job_completion(
+            client,
+            f"/api/daemon/jobs/{job_id}/complete",
+            {
+                "machine_id": machine["id"],
+                "agent_run": {
+                    "agent": "daemon-update",
+                    "returncode": result.returncode,
+                    "output": output or "Daemon update installed; restarting.",
+                },
+            },
+        )
+    except Exception as error:
+        _post_job_completion(
+            client,
+            f"/api/daemon/jobs/{job_id}/complete",
+            {"machine_id": machine["id"], "error": str(error)},
+        )
+        return
+    _restart_daemon_process()
+
+
+def _restart_daemon_process() -> None:
+    args = [sys.executable, "-m", "waveforward.cli", *sys.argv[1:]]
+    os.execv(sys.executable, args)
 
 
 def _post_job_completion(
@@ -701,12 +921,7 @@ def _load_or_create_daemon_state(root: Path) -> dict[str, Any]:
 
 def _save_daemon_state(root: Path, state: dict[str, Any]) -> None:
     path = _daemon_state_path(root)
-    path.write_text(
-        json.dumps(state, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
-    with suppress(OSError):
-        path.chmod(0o600)
+    write_json(path, state, mode=0o600)
 
 
 def _daemon_state_path(root: Path) -> Path:
@@ -750,9 +965,7 @@ def _read_daemon_pid(path: Path) -> int:
 
 
 def _write_daemon_pid(path: Path, pid: int) -> None:
-    path.write_text(f"{pid}\n", encoding="utf-8")
-    with suppress(OSError):
-        path.chmod(0o600)
+    atomic_write_text(path, f"{pid}\n", mode=0o600)
 
 
 def _pid_running(pid: int) -> bool:

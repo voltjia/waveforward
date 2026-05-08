@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from waveforward.core import AgentSyncError
+from waveforward.store import workspace_write_lock
 
 MAX_TEXT_FILE_BYTES = 1024 * 1024
 MAX_TREE_ENTRIES = 800
@@ -120,33 +121,36 @@ def write_workspace_file(
     if b"\x00" in encoded:
         raise AgentSyncError("Binary content cannot be saved in the code workspace.")
 
-    if file_path.exists():
-        if not file_path.is_file():
-            raise AgentSyncError("Workspace path is not a file.")
-        _ensure_readable_text_file(file_path, max_bytes=max_bytes)
-        current = file_path.read_bytes()
-        if not base_sha256:
-            raise AgentSyncError("base_sha256 is required to save an existing file.")
-        if hashlib.sha256(current).hexdigest() != base_sha256:
-            raise AgentSyncError("File changed on disk. Reload before saving.")
-        mode = file_path.stat().st_mode
-    else:
-        if not create:
-            raise AgentSyncError("Workspace file was not found.")
-        if not file_path.parent.exists():
-            raise AgentSyncError("Parent directory was not found.")
-        mode = 0o644
+    with workspace_write_lock(root):
+        if file_path.exists():
+            if not file_path.is_file():
+                raise AgentSyncError("Workspace path is not a file.")
+            _ensure_readable_text_file(file_path, max_bytes=max_bytes)
+            current = file_path.read_bytes()
+            if not base_sha256:
+                raise AgentSyncError(
+                    "base_sha256 is required to save an existing file."
+                )
+            if hashlib.sha256(current).hexdigest() != base_sha256:
+                raise AgentSyncError("File changed on disk. Reload before saving.")
+            mode = file_path.stat().st_mode
+        else:
+            if not create:
+                raise AgentSyncError("Workspace file was not found.")
+            if not file_path.parent.exists():
+                raise AgentSyncError("Parent directory was not found.")
+            mode = 0o644
 
-    temp_path = file_path.with_name(f".{file_path.name}.waveforward-tmp")
-    try:
-        if temp_path.exists() or temp_path.is_symlink():
-            temp_path.unlink()
-        temp_path.write_bytes(encoded)
-        os.chmod(temp_path, mode & 0o777)
-        os.replace(temp_path, file_path)
-    finally:
-        if temp_path.exists():
-            temp_path.unlink()
+        temp_path = file_path.with_name(f".{file_path.name}.waveforward-tmp")
+        try:
+            if temp_path.exists() or temp_path.is_symlink():
+                temp_path.unlink()
+            temp_path.write_bytes(encoded)
+            os.chmod(temp_path, mode & 0o777)
+            os.replace(temp_path, file_path)
+        finally:
+            if temp_path.exists():
+                temp_path.unlink()
     return read_workspace_file(root, path=relative, max_bytes=max_bytes)
 
 

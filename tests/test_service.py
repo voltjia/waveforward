@@ -9,11 +9,12 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from waveforward.core import initialize_workspace  # noqa: E402
+from waveforward.core import AgentSyncError, initialize_workspace  # noqa: E402
 from waveforward.runner import AgentRunResult  # noqa: E402
 from waveforward.service import (  # noqa: E402
     create_conversation,
     execute_slash_command,
+    get_conversation,
     run_conversation_turn,
 )
 
@@ -129,6 +130,26 @@ class ServiceConversationTests(unittest.TestCase):
 
             self.assertTrue(archived.command["archived"])
             self.assertIsNotNone(archived.conversation["archived_at"])
+
+    def test_cancel_check_prevents_agent_and_assistant_message(self) -> None:
+        with git_repo() as root:
+            initialize_workspace(root, machine_name="cancel-test")
+            conversation = create_conversation(root, title="Cancel session")
+
+            def should_not_run(*_args: object, **_kwargs: object) -> AgentRunResult:
+                raise AssertionError("agent runner should not be called")
+
+            with self.assertRaisesRegex(AgentSyncError, "Run canceled"):
+                run_conversation_turn(
+                    root,
+                    conversation["id"],
+                    content="Cancel this turn.",
+                    agent_runner=should_not_run,
+                    cancel_check=lambda: True,
+                )
+
+            saved = get_conversation(root, conversation["id"])
+            self.assertEqual([item["role"] for item in saved["messages"]], ["user"])
 
 
 class git_repo:
