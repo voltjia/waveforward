@@ -62,20 +62,22 @@ scripts/install.sh --repo https://github.com/voltjia/waveforward.git --ref main
 ## Connect A Daemon
 
 After installing the command, generate a setup token from a WaveForward service
-and run the generated daemon command inside the workspace that should execute
-agent turns:
+and run the generated daemon command inside a workspace that should execute
+agent turns. Add `--workspace /path/to/project` for each workspace managed by the
+same daemon:
 
 ```bash
 waveforward daemon-start \
   --server https://waveforward.tech \
   --auth-token '<setup-token>' \
   --machine 'Laptop' \
+  --workspace /path/to/workspace \
   --allow-agent-execution
 ```
 
 After first registration, the daemon stores its machine token under
-`.waveforward/daemon.json` and writes background process state under
-`.waveforward/daemon.pid` and `.waveforward/daemon.log`. Keep these files
+`~/.waveforward/daemon.json` and writes background process state under
+`~/.waveforward/daemon.pid` and `~/.waveforward/daemon.log`. Keep these files
 private.
 
 ## Install A Persistent Linux Daemon
@@ -83,6 +85,7 @@ private.
 ```bash
 scripts/install-daemon-service.sh \
   --workspace /path/to/workspace \
+  --workspace /path/to/another-workspace \
   --server https://waveforward.tech \
   --token '<setup-token>' \
   --machine 'Desktop'
@@ -99,7 +102,8 @@ waveforward daemon-status
 
 The setup token is stored in `~/.config/waveforward/waveforward-daemon.env`
 with file mode `0600`. It is short-lived; after the first successful
-registration, the daemon continues with its local machine token.
+registration, the daemon continues with its local machine token from
+`~/.waveforward/daemon.json`.
 
 ## Upgrade
 

@@ -155,6 +155,12 @@ def build_parser() -> argparse.ArgumentParser:
     daemon_parser.add_argument("--auth-token", help="Bearer token.")
     daemon_parser.add_argument("--machine", help="Human-readable machine name.")
     daemon_parser.add_argument(
+        "--workspace",
+        action="append",
+        default=[],
+        help="Workspace to expose. Can be passed more than once.",
+    )
+    daemon_parser.add_argument(
         "--update-manifest-url",
         help="Release manifest URL or path used for daemon self-updates.",
     )
@@ -185,6 +191,12 @@ def build_parser() -> argparse.ArgumentParser:
     daemon_start_parser.add_argument("--auth-password", help="Basic Auth password.")
     daemon_start_parser.add_argument("--auth-token", help="Bearer token.")
     daemon_start_parser.add_argument("--machine", help="Human-readable machine name.")
+    daemon_start_parser.add_argument(
+        "--workspace",
+        action="append",
+        default=[],
+        help="Workspace to expose. Can be passed more than once.",
+    )
     daemon_start_parser.add_argument(
         "--update-manifest-url",
         help="Release manifest URL or path used for daemon self-updates.",
@@ -407,7 +419,20 @@ def _daemon_config_from_args(args: argparse.Namespace) -> DaemonConfig:
         poll_interval=args.poll_interval,
         update_manifest_url=args.update_manifest_url
         or os.getenv("WAVEFORWARD_DAEMON_UPDATE_MANIFEST_URL"),
+        workspaces=tuple(args.workspace or _daemon_workspaces_from_env()),
     )
+
+
+def _daemon_workspaces_from_env() -> list[str]:
+    values = [
+        item.strip()
+        for item in os.getenv("WAVEFORWARD_DAEMON_WORKSPACES", "").split(os.pathsep)
+        if item.strip()
+    ]
+    single = os.getenv("WAVEFORWARD_DAEMON_WORKSPACE", "").strip()
+    if single:
+        values.insert(0, single)
+    return list(dict.fromkeys(values))
 
 
 def _cmd_daemon(args: argparse.Namespace) -> None:

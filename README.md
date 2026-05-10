@@ -72,16 +72,17 @@ uvx ruff check .
 
 WaveForward may inspect local Git working trees and execute configured agent
 commands inside user-selected workspaces. Treat daemon tokens and
-`.waveforward/daemon.json` as sensitive local credentials. Do not commit
-`.waveforward` state, API keys, agent credentials, or release artifacts that
-should not be public.
+`~/.waveforward/daemon.json` as sensitive local credentials. Do not commit API
+keys, agent credentials, local daemon state, or release artifacts that should not
+be public.
 
 Agent execution may use automatic edit or permission-bypass modes depending on
 the selected agent. The app-generated `waveforward daemon-start` command includes
-an explicit local acknowledgement for the selected workspace:
+an explicit local acknowledgement for the selected workspace. Pass `--workspace`
+more than once to expose multiple workspaces from the same user-level daemon:
 
 ```bash
-waveforward daemon-start --allow-agent-execution ...
+waveforward daemon-start --workspace /path/to/project --allow-agent-execution ...
 ```
 
 See `docs/security.md` and `SECURITY.md`.

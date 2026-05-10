@@ -26,6 +26,8 @@ from waveforward.daemon import (  # noqa: E402
     _daemon_runtime_payload,
     _daemon_update_manifest_url,
     _daemon_update_payload,
+    _daemon_workspaces,
+    _job_workspace_root,
     _load_or_create_daemon_state,
     _poll_once,
     _post_job_completion,
@@ -173,26 +175,29 @@ class DaemonClientTests(unittest.TestCase):
     def test_daemon_state_persists_machine_token(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            (root / ".waveforward").mkdir()
+            home = root / "home"
 
-            state = _load_or_create_daemon_state(root)
-            state["machine_token"] = "wfm_saved"
-            _save_daemon_state(root, state)
-            loaded = _load_or_create_daemon_state(root)
+            with patch.dict("os.environ", {"WAVEFORWARD_HOME": str(home)}):
+                state = _load_or_create_daemon_state(root)
+                state["machine_token"] = "wfm_saved"
+                _save_daemon_state(root, state)
+                loaded = _load_or_create_daemon_state(root)
 
             self.assertEqual(loaded["machine_id"], state["machine_id"])
             self.assertEqual(loaded["machine_token"], "wfm_saved")
+            self.assertTrue((home / "daemon.json").exists())
 
     def test_daemon_status_does_not_expose_machine_token(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            (root / ".waveforward").mkdir()
-            _save_daemon_state(
-                root,
-                {"machine_id": "machine_alpha", "machine_token": "wfm_secret"},
-            )
+            home = root / "home"
+            with patch.dict("os.environ", {"WAVEFORWARD_HOME": str(home)}):
+                _save_daemon_state(
+                    root,
+                    {"machine_id": "machine_alpha", "machine_token": "wfm_secret"},
+                )
 
-            status = daemon_status(root)
+                status = daemon_status(root)
 
             self.assertTrue(status["configured"])
             self.assertTrue(status["has_machine_token"])
@@ -202,6 +207,7 @@ class DaemonClientTests(unittest.TestCase):
     def test_start_daemon_process_detaches_and_sets_execution_opt_in(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
+            home = root / "home"
             subprocess.run(["git", "init"], cwd=root, check=True, capture_output=True)
             config = DaemonConfig(
                 server="https://app.example.test",
@@ -209,10 +215,13 @@ class DaemonClientTests(unittest.TestCase):
                 machine_name="Laptop",
                 update_manifest_url="https://example.test/manifest.json",
             )
-            with patch(
-                "waveforward.daemon.Popen",
-                return_value=_FakeProcess(),
-            ) as popen:
+            with (
+                patch.dict("os.environ", {"WAVEFORWARD_HOME": str(home)}),
+                patch(
+                    "waveforward.daemon.Popen",
+                    return_value=_FakeProcess(),
+                ) as popen,
+            ):
                 result = start_daemon_process(
                     root,
                     config=config,
@@ -235,20 +244,23 @@ class DaemonClientTests(unittest.TestCase):
                 kwargs["env"]["WAVEFORWARD_DAEMON_UPDATE_MANIFEST_URL"],
                 "https://example.test/manifest.json",
             )
-            pid_path = root / ".waveforward" / "daemon.pid"
+            pid_path = home / "daemon.pid"
             self.assertEqual(pid_path.read_text(encoding="utf-8"), "4242\n")
             self.assertNotIn("setup-secret", pid_path.read_text(encoding="utf-8"))
+            self.assertFalse((root / ".waveforward").exists())
 
     def test_start_daemon_process_reuses_running_daemon(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
+            home = root / "home"
             subprocess.run(["git", "init"], cwd=root, check=True, capture_output=True)
-            (root / ".waveforward").mkdir()
-            (root / ".waveforward" / "daemon.pid").write_text(
+            home.mkdir()
+            (home / "daemon.pid").write_text(
                 "4242\n",
                 encoding="utf-8",
             )
             with (
+                patch.dict("os.environ", {"WAVEFORWARD_HOME": str(home)}),
                 patch("waveforward.daemon._pid_running", return_value=True),
                 patch("waveforward.daemon.Popen") as popen,
             ):
@@ -336,10 +348,9 @@ class DaemonClientTests(unittest.TestCase):
 
         self.assertEqual(manifest, PUBLIC_RELEASE_MANIFEST_URL)
 
-    def test_daemon_runtime_reports_import_and_file_capabilities(self) -> None:
+    def test_daemon_runtime_reports_capabilities(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            (root / ".waveforward").mkdir()
             client = CloudClient(DaemonConfig(server="https://app.example.test"))
             config = DaemonConfig(server="https://app.example.test")
 
@@ -359,9 +370,49 @@ class DaemonClientTests(unittest.TestCase):
                 )
 
             self.assertEqual(
-                payload["capabilities"], ["session_import", "workspace_files"]
+                payload["capabilities"],
+                [
+                    "home_config",
+                    "multi_workspace",
+                    "session_import",
+                    "workspace_files",
+                ],
             )
             self.assertEqual(check.call_args.kwargs["headers"], {})
+
+    def test_daemon_workspaces_deduplicates_and_labels_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            nested = root / "nested"
+            nested.mkdir()
+            config = DaemonConfig(
+                server="https://app.example.test",
+                workspaces=(str(root), str(nested), str(root)),
+            )
+
+            workspaces = _daemon_workspaces(root, config)
+
+            self.assertEqual(
+                [item["path"] for item in workspaces],
+                [str(root), str(nested)],
+            )
+            self.assertEqual(workspaces[0]["name"], root.name)
+            self.assertTrue(workspaces[0]["active"])
+
+    def test_job_workspace_root_rejects_unregistered_workspace(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            allowed = root / "allowed"
+            denied = root / "denied"
+            allowed.mkdir()
+            denied.mkdir()
+
+            with self.assertRaisesRegex(Exception, "Workspace is not registered"):
+                _job_workspace_root(
+                    root,
+                    {"workspaces": [{"path": str(allowed.resolve())}]},
+                    {"workspace": str(denied.resolve())},
+                )
 
     def test_workspace_file_job_reads_remote_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
