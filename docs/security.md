@@ -29,8 +29,8 @@ control and trust.
 ## Tokens
 
 Daemon setup tokens are short-lived. After registration, the local daemon stores
-a machine token in `.waveforward/daemon.json`. The CLI redacts token values from
-status output, but the file itself is sensitive.
+a machine token in `~/.waveforward/daemon.json`. The CLI redacts token values
+from status output, but the file itself is sensitive.
 
 ## Updates
 

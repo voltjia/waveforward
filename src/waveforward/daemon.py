@@ -23,9 +23,8 @@ from urllib.request import Request, build_opener
 from waveforward import __version__
 from waveforward.core import (
     AgentSyncError,
-    initialize_workspace,
-    sync_dir,
-    update_machine_name,
+    utc_now,
+    workspace_root,
 )
 from waveforward.files import (
     list_workspace_tree,
@@ -38,12 +37,8 @@ from waveforward.history import (
     discover_agent_sessions,
     import_agent_sessions,
 )
-from waveforward.runner import AgentRunResult, agent_capabilities
-from waveforward.service import (
-    complete_conversation_turn,
-    save_conversation,
-    service_status,
-)
+from waveforward.runner import AgentRunResult, agent_capabilities, run_agent
+from waveforward.service import _render_agent_prompt, service_status
 from waveforward.store import atomic_write_text, write_json
 from waveforward.update import check_for_update, download_update_wheel
 
@@ -78,6 +73,12 @@ class _ActiveDaemonJob:
 
 
 @dataclass(frozen=True)
+class _DaemonTurn:
+    conversation: dict[str, Any]
+    agent_run: AgentRunResult | None
+
+
+@dataclass(frozen=True)
 class DaemonConfig:
     """Runtime settings for the outbound daemon."""
 
@@ -90,6 +91,7 @@ class DaemonConfig:
     request_retries: int = 3
     update_check_interval: float = 300.0
     update_manifest_url: str | None = None
+    workspaces: tuple[str, ...] = ()
 
     @classmethod
     def from_env(cls) -> DaemonConfig:
@@ -110,6 +112,7 @@ class DaemonConfig:
                 os.getenv("WAVEFORWARD_DAEMON_UPDATE_INTERVAL", "300.0")
             ),
             update_manifest_url=os.getenv("WAVEFORWARD_DAEMON_UPDATE_MANIFEST_URL"),
+            workspaces=_env_workspaces(),
         )
 
 
@@ -178,10 +181,7 @@ def run_daemon(
 ) -> None:
     """Run the outbound daemon loop."""
 
-    root = Path(start)
-    initialize_workspace(root)
-    if config.machine_name:
-        update_machine_name(root, config.machine_name)
+    root = Path(start).resolve()
 
     daemon_state = _load_or_create_daemon_state(root)
     client = CloudClient(config)
@@ -256,7 +256,6 @@ def start_daemon_process(
     """Start the outbound daemon as a detached background process."""
 
     root = Path(start).resolve()
-    initialize_workspace(root)
     pid_path = _daemon_pid_path(root)
     log_path = _daemon_log_path(root)
     existing_pid = _read_daemon_pid(pid_path)
@@ -409,17 +408,21 @@ def _register(
     config: DaemonConfig,
 ) -> dict[str, Any]:
     machine_id = str(daemon_state["machine_id"])
-    status = service_status(root)
+    workspaces = _daemon_workspaces(root, config)
+    primary = Path(workspaces[0]["path"]) if workspaces else root
+    status = service_status(primary)
+    machine_name = config.machine_name or status["machine"]
     result = client.post(
         "/api/daemon/register",
         {
             "machine_id": machine_id,
-            "name": status["machine"],
-            "workspace": status["workspace"],
+            "name": machine_name,
+            "workspace": str(primary),
+            "workspaces": workspaces,
             "agents": agent_capabilities(),
             "daemon": _daemon_runtime_payload(
                 client,
-                root,
+                primary,
                 daemon_state,
                 config=config,
             ),
@@ -447,6 +450,7 @@ def _process_job(
     reasoning_effort = str(job.get("reasoning_effort") or "")
     machine_name = str(machine.get("name") or job.get("machine") or "daemon")
     job_payload = dict(job.get("job") or {})
+    job_root = _job_workspace_root(root, machine, job_payload)
     model = model or str(job_payload.get("model") or "")
     reasoning_effort = reasoning_effort or str(
         job_payload.get("reasoning_effort") or ""
@@ -459,7 +463,7 @@ def _process_job(
     if job_kind == "daemon_update":
         _process_daemon_update_job(
             client,
-            root,
+            job_root,
             machine=machine,
             job=job,
             payload=job_payload,
@@ -470,7 +474,7 @@ def _process_job(
     if job_kind == "session_import_scan":
         _process_session_import_scan(
             client,
-            root,
+            job_root,
             machine=machine,
             job=job,
             payload=job_payload,
@@ -479,7 +483,7 @@ def _process_job(
     if job_kind == "session_import_import":
         _process_session_import_import(
             client,
-            root,
+            job_root,
             machine=machine,
             job=job,
             payload=job_payload,
@@ -489,7 +493,7 @@ def _process_job(
     if job_kind.startswith("workspace_"):
         _process_workspace_file_job(
             client,
-            root,
+            job_root,
             machine=machine,
             job=job,
             payload=job_payload,
@@ -497,8 +501,7 @@ def _process_job(
         )
         return
 
-    conversation = job["conversation"]
-    save_conversation(root, conversation)
+    conversation = dict(job["conversation"])
 
     def post_output(chunk: str) -> None:
         try:
@@ -510,9 +513,9 @@ def _process_job(
             return
 
     try:
-        turn = complete_conversation_turn(
-            root,
-            conversation["id"],
+        turn = _complete_daemon_conversation_turn(
+            job_root,
+            conversation,
             agent=agent,
             machine=machine_name,
             model=model,
@@ -553,6 +556,97 @@ def _post_canceled_completion(
         f"/api/daemon/jobs/{job_id}/complete",
         {"machine_id": machine["id"], "error": "Run canceled."},
     )
+
+
+def _complete_daemon_conversation_turn(
+    root: Path,
+    conversation: dict[str, Any],
+    *,
+    agent: str,
+    machine: str,
+    model: str | None,
+    reasoning_effort: str | None,
+    execute_agent: bool,
+    on_output: Any | None = None,
+    cancel_check: Any | None = None,
+) -> _DaemonTurn:
+    """Run a daemon turn without writing WaveForward metadata into the project."""
+
+    _raise_if_canceled(cancel_check)
+    agent_run = None
+    if execute_agent:
+        prompt = _render_agent_prompt(
+            conversation,
+            agent=agent,
+            machine=machine,
+            model=model,
+            reasoning_effort=reasoning_effort,
+        )
+        agent_run = run_agent(
+            root,
+            agent=agent,
+            prompt=prompt,
+            model=model,
+            reasoning_effort=reasoning_effort,
+            on_output=on_output,
+            cancel_check=cancel_check,
+        )
+        _raise_if_canceled(cancel_check)
+        conversation = _append_daemon_message(
+            conversation,
+            role="assistant",
+            content=agent_run.output or f"{agent} completed the turn.",
+            agent=agent,
+            machine=machine,
+            model=model,
+            reasoning_effort=reasoning_effort,
+        )
+    conversation["preferred"] = {
+        "agent": agent,
+        "machine": machine,
+    }
+    if model:
+        conversation["preferred"]["model"] = model
+    if reasoning_effort:
+        conversation["preferred"]["reasoning_effort"] = reasoning_effort
+    return _DaemonTurn(conversation=conversation, agent_run=agent_run)
+
+
+def _append_daemon_message(
+    conversation: dict[str, Any],
+    *,
+    role: str,
+    content: str,
+    agent: str,
+    machine: str,
+    model: str | None,
+    reasoning_effort: str | None,
+) -> dict[str, Any]:
+    now = utc_now()
+    message: dict[str, Any] = {
+        "id": f"msg_{uuid.uuid4().hex[:12]}",
+        "role": role,
+        "content": content.strip(),
+        "created_at": now,
+        "agent": agent,
+        "machine": machine,
+    }
+    if model:
+        message["model"] = model
+    if reasoning_effort:
+        message["reasoning_effort"] = reasoning_effort
+    next_conversation = dict(conversation)
+    next_conversation["messages"] = [
+        *list(conversation.get("messages") or []),
+        message,
+    ]
+    next_conversation["updated_at"] = now
+    return next_conversation
+
+
+def _raise_if_canceled(cancel_check: Any | None) -> None:
+    if cancel_check is not None and cancel_check():
+        raise AgentSyncError("Run canceled.")
 
 
 def _process_session_import_scan(
@@ -813,7 +907,12 @@ def _daemon_runtime_payload(
     config: DaemonConfig,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
-        "capabilities": ["session_import", "workspace_files"],
+        "capabilities": [
+            "home_config",
+            "multi_workspace",
+            "session_import",
+            "workspace_files",
+        ],
         "platform": platform.platform(),
         "python": platform.python_version(),
         "version": __version__,
@@ -895,6 +994,57 @@ def _daemon_update_manifest_url(client: CloudClient, config: DaemonConfig) -> st
     return PUBLIC_RELEASE_MANIFEST_URL
 
 
+def _daemon_workspaces(root: Path, config: DaemonConfig) -> list[dict[str, Any]]:
+    values = list(config.workspaces) or [str(root)]
+    normalized: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for value in values:
+        text = str(value or "").strip()
+        if not text:
+            continue
+        try:
+            path = workspace_root(Path(text).expanduser()).resolve()
+        except Exception:
+            path = Path(text).expanduser().resolve()
+        key = str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        normalized.append(
+            {
+                "id": uuid.uuid5(uuid.NAMESPACE_URL, key).hex[:16],
+                "path": key,
+                "name": path.name or key,
+                "active": path.exists(),
+            }
+        )
+    return normalized
+
+
+def _job_workspace_root(
+    fallback: Path,
+    machine: dict[str, Any],
+    payload: dict[str, Any],
+) -> Path:
+    requested = str(payload.get("workspace") or "").strip()
+    allowed = {
+        str(item.get("path") or "").strip()
+        for item in machine.get("workspaces") or []
+        if str(item.get("path") or "").strip()
+    }
+    legacy = str(machine.get("workspace") or "").strip()
+    if legacy:
+        allowed.add(legacy)
+    if requested:
+        candidate = Path(requested).expanduser().resolve()
+        if allowed and str(candidate) not in allowed:
+            raise AgentSyncError("Workspace is not registered for this daemon.")
+        return candidate
+    if legacy:
+        return Path(legacy).expanduser().resolve()
+    return fallback
+
+
 def _load_or_create_daemon_state(root: Path) -> dict[str, Any]:
     path = _daemon_state_path(root)
     data: dict[str, Any] = {}
@@ -925,15 +1075,21 @@ def _save_daemon_state(root: Path, state: dict[str, Any]) -> None:
 
 
 def _daemon_state_path(root: Path) -> Path:
-    return sync_dir(root) / "daemon.json"
+    return _daemon_home() / "daemon.json"
 
 
 def _daemon_pid_path(root: Path) -> Path:
-    return sync_dir(root) / "daemon.pid"
+    return _daemon_home() / "daemon.pid"
 
 
 def _daemon_log_path(root: Path) -> Path:
-    return sync_dir(root) / "daemon.log"
+    return _daemon_home() / "daemon.log"
+
+
+def _daemon_home() -> Path:
+    return Path(
+        os.getenv("WAVEFORWARD_HOME") or Path.home() / ".waveforward"
+    ).expanduser()
 
 
 def _daemon_process_command(config: DaemonConfig, *, python: str) -> list[str]:
@@ -953,6 +1109,8 @@ def _daemon_process_command(config: DaemonConfig, *, python: str) -> list[str]:
         command.extend(["--auth-token", config.auth_token])
     if config.machine_name:
         command.extend(["--machine", config.machine_name])
+    for workspace in config.workspaces:
+        command.extend(["--workspace", workspace])
     command.extend(["--poll-interval", str(config.poll_interval)])
     return command
 
@@ -1009,6 +1167,15 @@ def _env_positive_int(name: str, default: int) -> int:
     except ValueError as error:
         raise AgentSyncError(f"{name} must be an integer.") from error
     return max(parsed, 1)
+
+
+def _env_workspaces() -> tuple[str, ...]:
+    raw = os.getenv("WAVEFORWARD_DAEMON_WORKSPACES", "")
+    values = [item.strip() for item in raw.split(os.pathsep) if item.strip()]
+    single = os.getenv("WAVEFORWARD_DAEMON_WORKSPACE", "").strip()
+    if single:
+        values.insert(0, single)
+    return tuple(dict.fromkeys(values))
 
 
 def _payload_positive_int(value: Any, default: int) -> int:

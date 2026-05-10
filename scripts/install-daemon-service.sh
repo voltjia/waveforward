@@ -16,7 +16,7 @@ Usage: scripts/install-daemon-service.sh --workspace DIR --server URL --token TO
 Install and start a systemd user service for the WaveForward daemon.
 
 Options:
-  --workspace DIR       Workspace where agent turns should run.
+  --workspace DIR       Workspace to expose. Can be passed more than once.
   --server URL          WaveForward service URL.
   --token TOKEN         Setup token from Settings -> Machines.
   --machine NAME        Human-readable machine name.
@@ -26,14 +26,18 @@ Options:
   -h, --help            Show this help.
 
 The setup token is stored in a 0600 env file. After first registration, the
-daemon stores its long-lived machine token in WORKSPACE/.waveforward/daemon.json.
+daemon stores its long-lived machine token in ~/.waveforward/daemon.json.
 USAGE
 }
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --workspace)
-      WORKSPACE="$2"
+      if [ -z "$WORKSPACE" ]; then
+        WORKSPACE="$2"
+      else
+        WORKSPACE="$WORKSPACE:$2"
+      fi
       shift 2
       ;;
     --server)
@@ -83,7 +87,9 @@ if ! command -v systemctl >/dev/null 2>&1; then
   exit 1
 fi
 
-WORKSPACE="$(CDPATH= cd -- "$WORKSPACE" && pwd)"
+WORKSPACES="$WORKSPACE"
+PRIMARY_WORKSPACE="$(printf '%s' "$WORKSPACE" | awk -v RS=: 'NR==1 { print; exit }')"
+PRIMARY_WORKSPACE="$(CDPATH= cd -- "$PRIMARY_WORKSPACE" && pwd)"
 SERVICE_DIR="$HOME/.config/systemd/user"
 ENV_DIR="$HOME/.config/waveforward"
 SERVICE_FILE="$SERVICE_DIR/$SERVICE_NAME.service"
@@ -95,6 +101,7 @@ umask 077
   printf 'WAVEFORWARD_DAEMON_SERVER=%s\n' "$SERVER"
   printf 'WAVEFORWARD_DAEMON_TOKEN=%s\n' "$TOKEN"
   printf 'WAVEFORWARD_DAEMON_INTERVAL=%s\n' "$POLL_INTERVAL"
+  printf 'WAVEFORWARD_DAEMON_WORKSPACES=%s\n' "$WORKSPACES"
   if [ -n "$MACHINE" ]; then
     printf 'WAVEFORWARD_DAEMON_MACHINE=%s\n' "$MACHINE"
   fi
@@ -108,7 +115,7 @@ After=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=$WORKSPACE
+WorkingDirectory=$HOME
 EnvironmentFile=$ENV_FILE
 ExecStart=$WAVEFORWARD_BIN daemon
 Restart=always
